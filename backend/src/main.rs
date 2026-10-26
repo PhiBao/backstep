@@ -315,12 +315,21 @@ async fn ask(
                     ts_sec: ts,
                     label: format!("{} — evidence frame", part.name),
                 }];
+                let has_box = obj.is_some();
                 return Json(AskResponse {
                     answer: format!(
-                        "The {} was last clearly seen at {} — frame {} in this recording. Its tracked region is highlighted on that frame.",
+                        "The {} was last clearly seen at {} — frame {} in this recording.{}",
                         part.name,
-                        ts.map(|t| format!("{:.0}s", t)).unwrap_or_else(|| "an unknown time".into()),
-                        frame_seq.map(|f| f.to_string()).unwrap_or_else(|| "?".into())
+                        ts.map(|t| format!("{:.0}s", t))
+                            .unwrap_or_else(|| "an unknown time".into()),
+                        frame_seq
+                            .map(|f| f.to_string())
+                            .unwrap_or_else(|| "?".into()),
+                        if has_box {
+                            " Its tracked region is highlighted on that frame."
+                        } else {
+                            ""
+                        }
                     ),
                     citations,
                     verified: true,
@@ -383,6 +392,9 @@ async fn ask(
         .into_response();
     }
 
+    // If the model cannot answer but the deterministic matcher can, prefer
+    // the grounded answer: model refusals fall through instead of returning.
+    let mut model_refusal: Option<String> = None;
     // --- Model synthesis over the index, with deterministic citation validation ---
     if s.meta.has_key() {
         let index = json!({
@@ -407,6 +419,8 @@ async fn ask(
             .collect();
         let system = "You answer questions about one hands-on recording using ONLY the provided memory index. Every factual claim must be backed by citation_ids taken verbatim from the index ids. If the index does not contain the answer, set insufficient_evidence to true and say what is missing. Never invent ids, times, or parts.";
         let user = format!("Memory index:\n{}\n\nQuestion: {}", index, q);
+        // If the model cannot answer but the deterministic matcher can, prefer
+        // the grounded answer: model refusals fall through instead of returning.
         for model in ["muse-wonder-1.0", "muse-spark-1.3"] {
             if let Ok(v) = s
                 .meta
@@ -461,11 +475,10 @@ async fn ask(
                     }
                 }
                 if insufficient || citations.is_empty() {
-                    return Json(AskResponse {
-                        answer: if insufficient { answer_text } else { "The memory does not contain verified evidence for that. Try asking about a specific part or step from this recording.".into() },
-                        citations: vec![], verified: false, insufficient_evidence: true,
-                        source: model.to_string(),
-                    }).into_response();
+                    if insufficient && !answer_text.is_empty() && model_refusal.is_none() {
+                        model_refusal = Some(format!("{} (source: {})", answer_text, model));
+                    }
+                    continue;
                 }
                 return Json(AskResponse {
                     answer: answer_text,
@@ -512,7 +525,7 @@ async fn ask(
         }
     }
     Json(AskResponse {
-        answer: "I don't have verified evidence for that in this recording. Ask about a named part (\"where is the …?\") or the reassembly order (\"how does this go back together?\").".into(),
+        answer: model_refusal.unwrap_or_else(|| "I don't have verified evidence for that in this recording. Ask about a named part (\"where is the …?\") or the reassembly order (\"how does this go back together?\").".into()),
         citations: vec![], verified: false, insufficient_evidence: true, source: "index".into(),
     })
     .into_response()

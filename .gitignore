@@ -9,3 +9,7 @@ web/.next/
 *.db-shm
 *.db-wal
 .DS_Store
+
+*.mp4
+*.mov
+.env.local

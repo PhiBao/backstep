@@ -71,6 +71,13 @@ export default function Home() {
   const fileRef = useRef<HTMLInputElement>(null);
   const titleRef = useRef<HTMLInputElement>(null);
 
+  // Backend base URL. Empty string = same-origin Next.js proxy (fine for reads
+  // and small uploads, but the proxy fails on ~100MB bodies). Set
+  // NEXT_PUBLIC_BACKEND_URL=http://127.0.0.1:8787 (dev) or your deployed API
+  // so large teardown uploads go straight to the Rust service.
+  const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL || "";
+  const api = (p: string) => `${BACKEND}${p}`;
+
   const MAX_BYTES = 200 * 1024 * 1024;
   const fmtSize = (n: number) =>
     n >= 1024 * 1024 ? `${(n / (1024 * 1024)).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`;
@@ -108,7 +115,7 @@ export default function Home() {
     const fd = new FormData();
     fd.append("file", file);
     if (title) fd.append("title", title);
-    const r = await fetch("/api/recordings", { method: "POST", body: fd });
+    const r = await fetch(api("/api/recordings"), { method: "POST", body: fd });
     const text = await r.text();
     let j: { recording?: Recording; error?: string } = {};
     try {
@@ -126,7 +133,7 @@ export default function Home() {
 
   const loadRecordings = useCallback(async () => {
     try {
-      const r = await fetch("/api/recordings");
+      const r = await fetch(api("/api/recordings"));
       const j = await r.json();
       setRecordings(j.recordings || []);
       return (j.recordings || []) as Recording[];
@@ -138,11 +145,11 @@ export default function Home() {
   const loadDetail = useCallback(async (id: string) => {
     if (!id) return;
     try {
-      const r = await fetch(`/api/recordings/${id}`);
+      const r = await fetch(api(`/api/recordings/${id}`));
       if (!r.ok) return;
       const j = (await r.json()) as Detail;
       setDetail(j);
-      const mr = await fetch(`/api/recordings/${id}/manual`);
+      const mr = await fetch(api(`/api/recordings/${id}/manual`));
       if (mr.ok) {
         const mj = await mr.json();
         setManual(mj.manual || []);
@@ -153,7 +160,7 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    fetch("/health").then((r) => r.json()).then(setHealth).catch(() => setHealth(null));
+    fetch(api("/health")).then((r) => r.json()).then(setHealth).catch(() => setHealth(null));
     loadRecordings().then((recs) => {
       if (recs.length > 0) setSelectedId(recs[0].id);
     });
@@ -215,7 +222,7 @@ export default function Home() {
     setUploadError(null);
     try {
       if (clash && dupTitle) {
-        await fetch(`/api/recordings/${clash.id}`, { method: "DELETE" });
+        await fetch(api(`/api/recordings/${clash.id}`), { method: "DELETE" });
       }
       const rec = await postUpload(title);
       const recs = await loadRecordings();
@@ -237,7 +244,7 @@ export default function Home() {
     if (!questionText || !selectedId) return;
     setAsking(true);
     try {
-      const r = await fetch(`/api/recordings/${selectedId}/ask`, {
+      const r = await fetch(api(`/api/recordings/${selectedId}/ask`), {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ question: questionText }),
@@ -253,7 +260,7 @@ export default function Home() {
   async function onRename(part: Part) {
     const name = (renames[part.id] ?? part.name).trim();
     if (!name || name === part.name) return;
-    await fetch(`/api/parts/${part.id}`, {
+    await fetch(api(`/api/parts/${part.id}`), {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ name }),
@@ -262,12 +269,12 @@ export default function Home() {
   }
 
   async function onRerun() {
-    await fetch(`/api/recordings/${selectedId}/rerun`, { method: "POST" });
+    await fetch(api(`/api/recordings/${selectedId}/rerun`), { method: "POST" });
     loadDetail(selectedId);
   }
 
   async function onDelete(id: string) {
-    await fetch(`/api/recordings/${id}`, { method: "DELETE" });
+    await fetch(api(`/api/recordings/${id}`), { method: "DELETE" });
     const recs = await loadRecordings();
     setSelectedId(recs[0]?.id || "");
   }
@@ -418,7 +425,7 @@ export default function Home() {
                 {currentFrame ? (
                   <>
                     {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img className="frame" src={currentFrame.url} alt={`Frame ${currentFrame.seq} at ${tc(currentFrame.ts_sec)}`} />
+                    <img className="frame" src={`${BACKEND}${currentFrame.url}`} alt={`Frame ${currentFrame.seq} at ${tc(currentFrame.ts_sec)}`} />
                     {frameObjects.map((o) => (
                       <div
                         key={o.id}
@@ -456,7 +463,7 @@ export default function Home() {
                     {frames.map((f) => (
                       <button key={f.seq} className={f.seq === currentFrame?.seq ? "active" : ""} onClick={() => setFrameSeq(f.seq)}>
                         {/* eslint-disable-next-line @next/next/no-img-element */}
-                        <img src={f.url} alt="" />
+                        <img src={`${BACKEND}${f.url}`} alt="" />
                         <span className="tc">{tc(f.ts_sec)}</span>
                       </button>
                     ))}

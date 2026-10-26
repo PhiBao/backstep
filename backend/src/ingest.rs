@@ -61,6 +61,59 @@ async fn run_inner(state: AppState, rid: &str, video_path: &Path) -> Result<(), 
         None,
     );
 
+    // --- Normalize: 720p H.264 + faststart working copy. The Meta APIs bill
+    // per frame/token and only accept MP4/MOV H.264/H.265/MPEG-4, so a 4K
+    // phone original is transcoded once here. Everything downstream
+    // (frames, Files upload, Spark, SAM) uses the normalized copy.
+    let normalized = video_path
+        .parent()
+        .map(|d| d.join("normalized.mp4"))
+        .unwrap_or_else(|| PathBuf::from("normalized.mp4"));
+    let normalized_ok = cmd(&[
+        "ffmpeg",
+        "-y",
+        "-i",
+        video_path.to_str().unwrap_or_default(),
+        "-vf",
+        "scale=1280:-2",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-c:a",
+        "aac",
+        "-movflags",
+        "+faststart",
+        normalized.to_str().unwrap_or_default(),
+    ])
+    .await
+    .is_ok()
+        && normalized.exists();
+    let work_path = if normalized_ok {
+        &normalized
+    } else {
+        video_path
+    };
+    if normalized_ok {
+        db::trace(
+            &db,
+            rid,
+            "ffmpeg",
+            "Normalized to 720p H.264 (faststart) for analysis",
+            None,
+        );
+    } else {
+        db::trace(
+            &db,
+            rid,
+            "ffmpeg",
+            "Normalization skipped — analysing the original file",
+            None,
+        );
+    }
+
     let duration: Option<f64> = cmd(&[
         "ffprobe",
         "-v",
@@ -69,7 +122,7 @@ async fn run_inner(state: AppState, rid: &str, video_path: &Path) -> Result<(), 
         "format=duration",
         "-of",
         "default=noprint_wrappers=1:nokey=1",
-        video_path.to_str().unwrap_or_default(),
+        work_path.to_str().unwrap_or_default(),
     ])
     .await
     .ok()
@@ -82,7 +135,7 @@ async fn run_inner(state: AppState, rid: &str, video_path: &Path) -> Result<(), 
         "ffmpeg",
         "-y",
         "-i",
-        video_path.to_str().unwrap_or_default(),
+        work_path.to_str().unwrap_or_default(),
         "-vf",
         "fps=1,scale=960:-2",
         "-frames:v",
@@ -143,6 +196,8 @@ async fn run_inner(state: AppState, rid: &str, video_path: &Path) -> Result<(), 
 
     // --- Muse Spark video understanding (cached by content hash) ---
     db::set_status(&db, rid, "analyzing", None);
+    // Cache on the ORIGINAL bytes: identical uploads share one extraction
+    // even if normalization settings change later.
     let hash = sha256_file(video_path);
     let cache_key = format!("extract:{}:v1", hash);
     let extraction: Extraction = if let Some(cached) = db::cache_get(&db, &cache_key) {
@@ -163,7 +218,7 @@ async fn run_inner(state: AppState, rid: &str, video_path: &Path) -> Result<(), 
             None,
         );
         eprintln!("[ingest {}] uploading to Meta Files API...", rid);
-        let file_id = state.meta.upload_file(video_path).await?;
+        let file_id = state.meta.upload_file(work_path).await?;
         eprintln!("[ingest {}] upload done: {}", rid, file_id);
         db::trace(
             &db,
@@ -242,84 +297,16 @@ async fn run_inner(state: AppState, rid: &str, video_path: &Path) -> Result<(), 
 
     // --- SAM 3.1 segmentation on evidence frames ---
     db::set_status(&db, rid, "segmenting", None);
-    for (pid, prompt, ev_seq, frame_path) in part_ids {
+    for (pid, prompt, ev_seq, frame_path) in &part_ids {
         let seq = match ev_seq {
-            Some(s) => s,
+            Some(s) => *s,
             None => continue,
         };
-        let bytes = match tokio::fs::read(&frame_path).await {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        let mut hasher = Sha256::new();
-        hasher.update(&bytes);
-        let sam_key = format!("sam:{}:{}", hex(&hasher.finalize()), prompt);
-        let raw = if let Some(cached) = db::cache_get(&db, &sam_key) {
-            cached
-        } else {
-            db::trace(
-                &db,
-                rid,
-                "sam-3.1",
-                &format!("Segmenting \"{}\" on frame {}", prompt, seq),
-                None,
-            );
-            match state.meta.sam_segment_image(&prompt, &bytes).await {
-                Ok(r) => {
-                    db::cache_put(&db, &sam_key, &r);
-                    r
-                }
-                Err(e) => {
-                    db::trace(
-                        &db,
-                        rid,
-                        "sam-3.1",
-                        &format!("SAM failed for \"{}\": {}", prompt, e),
-                        None,
-                    );
-                    continue;
-                }
-            }
-        };
-        let records = parse_sam_text(&raw);
-        if records.is_empty() {
-            db::trace(
-                &db,
-                rid,
-                "sam-3.1",
-                &format!(
-                    "No match for \"{}\" on frame {} (zero matches is a valid result)",
-                    prompt, seq
-                ),
-                None,
-            );
-            continue;
-        }
-        {
-            let c = db.lock().unwrap();
-            for rec in &records {
-                let _ = c.execute(
-                    "INSERT INTO sam_objects(id,recording_id,part_id,concept,frame_seq,sam_frame,object_id,x1,y1,x2,y2,frame_w,frame_h,confidence,mask_data) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
-                    params![
-                        uuid::Uuid::new_v4().to_string(), rid, pid, prompt, seq, rec.sam_frame, rec.object_id,
-                        rec.x1, rec.y1, rec.x2, rec.y2, rec.frame_w, rec.frame_h, rec.confidence, rec.mask_data
-                    ],
-                );
-            }
-        }
-        db::trace(
-            &db,
-            rid,
-            "sam-3.1",
-            &format!(
-                "\"{}\" → {} object(s) on frame {}",
-                prompt,
-                records.len(),
-                seq
-            ),
-            None,
-        );
+        segment_frame(&state, &db, rid, pid, prompt, seq, frame_path).await?;
     }
+
+    // --- Retry zero-match parts with simplified prompts on nearby frames ---
+    retry_zero_match_parts(&state, &db, rid).await;
 
     // --- Reverse manual synthesis (Muse Wonder, Spark fallback) ---
     let steps_now = db::list_steps(&db, rid);
@@ -419,6 +406,258 @@ async fn run_inner(state: AppState, rid: &str, video_path: &Path) -> Result<(), 
         None,
     );
     Ok(())
+}
+
+/// Segment one prompt on one frame; insert matches linked to `part_id`.
+/// Returns the number of objects inserted. Cached by (frame bytes, prompt).
+async fn segment_frame(
+    state: &AppState,
+    db: &db::Db,
+    rid: &str,
+    part_id: &str,
+    prompt: &str,
+    seq: i64,
+    frame_path: &Path,
+) -> Result<usize, anyhow::Error> {
+    let bytes = tokio::fs::read(frame_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("frame {} unreadable: {}", seq, e))?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let sam_key = format!("sam:{}:{}", hex(&hasher.finalize()), prompt);
+    let raw = if let Some(cached) = db::cache_get(db, &sam_key) {
+        cached
+    } else {
+        db::trace(
+            db,
+            rid,
+            "sam-3.1",
+            &format!("Segmenting \"{}\" on frame {}", prompt, seq),
+            None,
+        );
+        match state.meta.sam_segment_image(prompt, &bytes).await {
+            Ok(r) => {
+                db::cache_put(db, &sam_key, &r);
+                r
+            }
+            Err(e) => {
+                db::trace(
+                    db,
+                    rid,
+                    "sam-3.1",
+                    &format!("SAM failed for \"{}\": {}", prompt, e),
+                    None,
+                );
+                return Ok(0);
+            }
+        }
+    };
+    let records = parse_sam_text(&raw);
+    if records.is_empty() {
+        db::trace(
+            db,
+            rid,
+            "sam-3.1",
+            &format!(
+                "No match for \"{}\" on frame {} (zero matches is a valid result)",
+                prompt, seq
+            ),
+            None,
+        );
+        return Ok(0);
+    }
+    {
+        let c = db.lock().unwrap();
+        for rec in &records {
+            let _ = c.execute(
+                "INSERT INTO sam_objects(id,recording_id,part_id,concept,frame_seq,sam_frame,object_id,x1,y1,x2,y2,frame_w,frame_h,confidence,mask_data) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                params![
+                    uuid::Uuid::new_v4().to_string(), rid, part_id, prompt, seq, rec.sam_frame, rec.object_id,
+                    rec.x1, rec.y1, rec.x2, rec.y2, rec.frame_w, rec.frame_h, rec.confidence, rec.mask_data
+                ],
+            );
+        }
+    }
+    db::trace(
+        db,
+        rid,
+        "sam-3.1",
+        &format!(
+            "\"{}\" → {} object(s) on frame {}",
+            prompt,
+            records.len(),
+            seq
+        ),
+        None,
+    );
+    Ok(records.len())
+}
+
+/// SAM is weak on fine-grained phrasing ("small black screw"). For parts with
+/// zero objects, ask the model for simpler variants ("screw", "black screw")
+/// and try them on the evidence frame plus neighbours. Bounded: max 4 parts,
+/// max 2 variants each, max 3 frames each, stop at first success per part.
+async fn retry_zero_match_parts(state: &AppState, db: &db::Db, rid: &str) {
+    let parts = db::list_parts(db, rid);
+    let objects = db::list_objects(db, rid);
+    let missing: Vec<_> = parts
+        .iter()
+        .filter(|p| {
+            !objects
+                .iter()
+                .any(|o| o.part_id.as_deref() == Some(p.id.as_str()))
+        })
+        .take(4)
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    db::trace(
+        db,
+        rid,
+        "sam-3.1",
+        &format!(
+            "Retrying {} unmatched part(s) with simplified prompts",
+            missing.len()
+        ),
+        None,
+    );
+    let schema = serde_json::json!({
+        "type": "object", "additionalProperties": false,
+        "properties": {"variants": {"type": "array", "items": {
+            "type": "object", "additionalProperties": false,
+            "properties": {"name": {"type": "string"}, "prompts": {"type": "array", "items": {"type": "string"}}},
+            "required": ["name", "prompts"]
+        }}},
+        "required": ["variants"]
+    });
+    let user = format!(
+        "For each part below, propose up to 2 SIMPLER noun phrases for an image segmentation model. Rules: 1-2 words each, concrete visual nouns only, no verbs, drop materials/sizes unless essential (\"screw\" beats \"small black screw\", \"fan\" beats \"black computer cooling fan\").\n{}",
+        missing
+            .iter()
+            .map(|p| format!("- {} (current prompt: \"{}\")", p.name, p.sam_prompt))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let mut variants: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for model in ["muse-wonder-1.0", "muse-spark-1.3"] {
+        match state
+            .meta
+            .chat_json(
+                model,
+                "You write short segmentation prompts. Return JSON only.",
+                &user,
+                "simplify_prompts",
+                schema.clone(),
+            )
+            .await
+        {
+            Ok(v) => {
+                if let Some(arr) = v.get("variants").and_then(|x| x.as_array()) {
+                    for item in arr {
+                        if let (Some(name), Some(ps)) = (
+                            item.get("name").and_then(|x| x.as_str()),
+                            item.get("prompts").and_then(|x| x.as_array()),
+                        ) {
+                            // Index by normalized name: models often recase labels.
+                            variants.insert(
+                                name.to_lowercase(),
+                                ps.iter()
+                                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                    .take(2)
+                                    .collect(),
+                            );
+                        }
+                    }
+                }
+                break;
+            }
+            Err(e) => {
+                db::trace(
+                    db,
+                    rid,
+                    "sam-3.1",
+                    &format!("Prompt simplification via {} failed: {}", model, e),
+                    None,
+                );
+            }
+        }
+    }
+    if variants.is_empty() {
+        db::trace(
+            db,
+            rid,
+            "sam-3.1",
+            "Model returned no usable variants — falling back to head nouns",
+            None,
+        );
+    }
+    let frame_count = db::list_frames(db, rid).len() as i64;
+    for part in missing {
+        // Model variants (case-insensitive) plus a deterministic fallback:
+        // the head noun of the original prompt ("screw" from "small black
+        // screw") is usually the best single-word prompt.
+        let mut vars: Vec<String> = variants
+            .get(&part.name.to_lowercase())
+            .cloned()
+            .unwrap_or_default();
+        if let Some(head) = part
+            .sam_prompt
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| t.len() > 2)
+            .last()
+        {
+            if !vars.iter().any(|v| v.eq_ignore_ascii_case(head)) {
+                vars.push(head.to_string());
+            }
+        }
+        vars.truncate(3);
+        if vars.is_empty() {
+            continue;
+        }
+        db::trace(
+            db,
+            rid,
+            "sam-3.1",
+            &format!(
+                "Simplified prompts for \"{}\": {}",
+                part.name,
+                vars.join(", ")
+            ),
+            None,
+        );
+        let ev = part.evidence_frame_seq.unwrap_or(0);
+        let mut seqs = vec![ev];
+        if ev > 3 {
+            seqs.push(ev - 3);
+        }
+        if ev + 3 < frame_count {
+            seqs.push(ev + 3);
+        }
+        let mut done = false;
+        for seq in seqs {
+            if done {
+                break;
+            }
+            let Some(fp) = db::frame_path(db, rid, seq) else {
+                continue;
+            };
+            let fp = PathBuf::from(fp);
+            for var in vars.iter().take(2) {
+                if var.trim().is_empty() || *var == part.sam_prompt {
+                    continue;
+                }
+                match segment_frame(state, db, rid, &part.id, var, seq, &fp).await {
+                    Ok(n) if n > 0 => {
+                        done = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 /// Re-run analysis for a recording whose video already exists (e.g. after key arrives).

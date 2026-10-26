@@ -148,6 +148,7 @@ Production build: `make build` (release backend + Next.js build), then
 | `PORT` | no | backend port, default `8787` |
 | `BACKSTEP_DATA_DIR` | no | storage dir, default `../data` (relative to `backend/`) |
 | `BACKSTEP_BACKEND` | no | frontend rewrite target, default `http://127.0.0.1:8787` |
+| `NEXT_PUBLIC_BACKEND_URL` | no (set in `web/.env.local`) | browser → backend direct URL, bypasses the Next.js proxy for large uploads |
 
 ### Tests
 
