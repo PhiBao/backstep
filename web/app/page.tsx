@@ -1,0 +1,506 @@
+"use client";
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+type Recording = {
+  id: string; title: string; kind: string; status: string;
+  duration_sec: number | null; frame_count: number; created_at: string; error: string | null;
+};
+type Frame = { seq: number; ts_sec: number; url: string; width: number; height: number };
+type Part = {
+  id: string; name: string; sam_prompt: string; color: string | null;
+  first_seen_sec: number | null; last_seen_sec: number | null;
+  evidence_frame_seq: number | null; confirmed: boolean;
+};
+type Step = {
+  id: string; order_index: number; start_sec: number; end_sec: number; action: string;
+  reverse_action: string | null; part_names: string[];
+  state_before: string | null; state_after: string | null; evidence_frame_seq: number | null;
+};
+type SamObject = {
+  id: string; part_id: string | null; concept: string; frame_seq: number; object_id: number;
+  x1: number; y1: number; x2: number; y2: number; frame_w: number; frame_h: number;
+  confidence: number | null;
+};
+type TraceEvent = { id: number; ts: string; stage: string; message: string; detail: string | null };
+type Detail = {
+  recording: Recording; frames: Frame[]; parts: Part[]; steps: Step[];
+  objects: SamObject[]; trace: TraceEvent[];
+};
+type ManualStep = {
+  manual_order: number; step_id: string; instruction: string; original_action: string;
+  part_names: string[]; state_target: string | null; evidence_frame_seq: number | null;
+  citation: { type: string; id: string; frame_seq: number | null; ts_sec: number | null; label: string };
+};
+type Citation = { type: string; id: string; frame_seq: number | null; ts_sec: number | null; label: string };
+type AskResponse = {
+  answer: string; citations: Citation[]; verified: boolean;
+  insufficient_evidence: boolean; source: string;
+};
+
+const EXAMPLES = [
+  "Where did I put the trim cleat screw?",
+  "How does this go back together?",
+  "Where is the chicken loop?",
+  "What happened to the safety line?",
+];
+
+function tc(sec: number | null | undefined): string {
+  if (sec === null || sec === undefined || Number.isNaN(sec)) return "--:--";
+  const m = Math.floor(sec / 60);
+  const s = Math.floor(sec % 60);
+  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
+export default function Home() {
+  const [health, setHealth] = useState<{ meta_api_configured: boolean } | null>(null);
+  const [recordings, setRecordings] = useState<Recording[]>([]);
+  const [selectedId, setSelectedId] = useState<string>("");
+  const [detail, setDetail] = useState<Detail | null>(null);
+  const [manual, setManual] = useState<ManualStep[]>([]);
+  const [frameSeq, setFrameSeq] = useState<number>(0);
+  const [tab, setTab] = useState<"manual" | "finder" | "parts" | "trace">("manual");
+  const [question, setQuestion] = useState("");
+  const [askResult, setAskResult] = useState<AskResponse | null>(null);
+  const [asking, setAsking] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [renames, setRenames] = useState<Record<string, string>>({});
+  const fileRef = useRef<HTMLInputElement>(null);
+  const titleRef = useRef<HTMLInputElement>(null);
+
+  const loadRecordings = useCallback(async () => {
+    try {
+      const r = await fetch("/api/recordings");
+      const j = await r.json();
+      setRecordings(j.recordings || []);
+      return (j.recordings || []) as Recording[];
+    } catch {
+      return [];
+    }
+  }, []);
+
+  const loadDetail = useCallback(async (id: string) => {
+    if (!id) return;
+    try {
+      const r = await fetch(`/api/recordings/${id}`);
+      if (!r.ok) return;
+      const j = (await r.json()) as Detail;
+      setDetail(j);
+      const mr = await fetch(`/api/recordings/${id}/manual`);
+      if (mr.ok) {
+        const mj = await mr.json();
+        setManual(mj.manual || []);
+      }
+    } catch {
+      /* backend warming up */
+    }
+  }, []);
+
+  useEffect(() => {
+    fetch("/health").then((r) => r.json()).then(setHealth).catch(() => setHealth(null));
+    loadRecordings().then((recs) => {
+      if (recs.length > 0) setSelectedId(recs[0].id);
+    });
+  }, [loadRecordings]);
+
+  useEffect(() => {
+    if (!selectedId) return;
+    setAskResult(null);
+    setFrameSeq(0);
+    loadDetail(selectedId);
+  }, [selectedId, loadDetail]);
+
+  // Poll while a recording is being analysed.
+  useEffect(() => {
+    const status = detail?.recording.status;
+    if (!selectedId || !status) return;
+    if (["ready", "awaiting_key", "failed"].includes(status)) return;
+    const t = setInterval(() => {
+      loadDetail(selectedId);
+      loadRecordings();
+    }, 2500);
+    return () => clearInterval(t);
+  }, [detail?.recording.status, selectedId, loadDetail, loadRecordings]);
+
+  const frames = detail?.frames || [];
+  const currentFrame = useMemo(
+    () => frames.find((f) => f.seq === frameSeq) || frames[0],
+    [frames, frameSeq]
+  );
+  const frameObjects = useMemo(
+    () => (detail?.objects || []).filter((o) => currentFrame && o.frame_seq === currentFrame.seq),
+    [detail, currentFrame]
+  );
+  const partName = useCallback(
+    (pId: string | null) => detail?.parts.find((p) => p.id === pId)?.name || "",
+    [detail]
+  );
+
+  function seek(seq: number | null) {
+    if (seq === null || seq === undefined) return;
+    setFrameSeq(seq);
+    document.querySelector(".frame-wrap")?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+
+  async function onUpload(e: React.FormEvent) {
+    e.preventDefault();
+    const file = fileRef.current?.files?.[0];
+    if (!file) return;
+    setUploading(true);
+    setUploadError(null);
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      const t = titleRef.current?.value?.trim();
+      if (t) fd.append("title", t);
+      const r = await fetch("/api/recordings", { method: "POST", body: fd });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || "upload failed");
+      await loadRecordings();
+      setSelectedId(j.recording.id);
+      if (fileRef.current) fileRef.current.value = "";
+      if (titleRef.current) titleRef.current.value = "";
+    } catch (err) {
+      setUploadError(err instanceof Error ? err.message : "upload failed");
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  async function onAsk(q?: string) {
+    const questionText = (q ?? question).trim();
+    if (!questionText || !selectedId) return;
+    setAsking(true);
+    try {
+      const r = await fetch(`/api/recordings/${selectedId}/ask`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ question: questionText }),
+      });
+      const j = (await r.json()) as AskResponse;
+      setAskResult(j);
+      if (j.citations.length > 0) seek(j.citations[0].frame_seq);
+    } finally {
+      setAsking(false);
+    }
+  }
+
+  async function onRename(part: Part) {
+    const name = (renames[part.id] ?? part.name).trim();
+    if (!name || name === part.name) return;
+    await fetch(`/api/parts/${part.id}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    loadDetail(selectedId);
+  }
+
+  async function onRerun() {
+    await fetch(`/api/recordings/${selectedId}/rerun`, { method: "POST" });
+    loadDetail(selectedId);
+  }
+
+  async function onDelete(id: string) {
+    await fetch(`/api/recordings/${id}`, { method: "DELETE" });
+    const recs = await loadRecordings();
+    setSelectedId(recs[0]?.id || "");
+  }
+
+  const rec = detail?.recording;
+
+  return (
+    <div className="shell">
+      <header className="topbar">
+        <div className="mark">
+          <div className="mark-badge" aria-hidden>
+            <svg width="22" height="22" viewBox="0 0 64 64">
+              <rect x="6" y="10" width="52" height="44" rx="5" fill="none" stroke="#FAF7F2" strokeWidth="5" />
+              <path d="M42 22 L26 32 L42 42" fill="none" stroke="#FF5A1F" strokeWidth="6" />
+            </svg>
+          </div>
+          <div>
+            <div className="wordmark">BACKSTEP</div>
+            <div className="tagline">The rewind button for the real world.</div>
+          </div>
+        </div>
+        <div className="topbar-spacer" />
+        <span className={`pill ${health?.meta_api_configured ? "on" : "off"}`} title="Meta Model API status">
+          {health === null
+            ? "backend …"
+            : health.meta_api_configured
+              ? "Meta Model API · live"
+              : "Meta Model API · key not set (sample mode)"}
+        </span>
+      </header>
+
+      <div className="layout">
+        <aside className="rail">
+          <section>
+            <h2>Memories</h2>
+            {recordings.map((r) => (
+              <button
+                key={r.id}
+                className={`rec-card ${r.id === selectedId ? "active" : ""}`}
+                onClick={() => setSelectedId(r.id)}
+              >
+                <div className="rec-title">{r.title}</div>
+                <div className="rec-meta">
+                  {r.kind === "sample" ? <span className="badge sample">Sample</span> : <span className="badge status">Upload</span>}{" "}
+                  <span className="badge status">{r.status}</span>{" "}
+                  {r.frame_count} frames · {tc(r.duration_sec)}
+                </div>
+              </button>
+            ))}
+            {recordings.length === 0 && <div className="empty">No recordings yet. The backend may still be starting.</div>}
+          </section>
+
+          <section>
+            <h2>New teardown</h2>
+            <form className="upload-box" onSubmit={onUpload}>
+              <div style={{ fontSize: 13 }}>
+                Film yourself taking something apart (.mp4 / .mov, ≤ 200 MB). Backstep extracts the parts and steps.
+              </div>
+              <input ref={titleRef} type="text" placeholder="Title (optional)" aria-label="Recording title" />
+              <input ref={fileRef} type="file" accept="video/mp4,video/quicktime,.mp4,.mov" aria-label="Video file" required />
+              <div style={{ marginTop: 10, display: "flex", gap: 8 }}>
+                <button className="btn small" type="submit" disabled={uploading}>
+                  {uploading ? "Uploading…" : "Build memory"}
+                </button>
+              </div>
+              {uploadError && <div style={{ color: "var(--danger)", fontSize: 13, marginTop: 8 }}>{uploadError}</div>}
+              {!health?.meta_api_configured && (
+                <div style={{ fontSize: 12, color: "var(--ink-soft)", marginTop: 8 }}>
+                  Without <span className="mono">MODEL_API_KEY</span> on the server, uploads stop after frame extraction — nothing is faked.
+                </div>
+              )}
+            </form>
+          </section>
+
+          {rec && rec.kind !== "sample" && (
+            <section>
+              <h2>Manage</h2>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button className="btn ghost small" onClick={onRerun}>Re-run analysis</button>
+                <button className="btn ghost small" onClick={() => onDelete(rec.id)}>Delete</button>
+              </div>
+            </section>
+          )}
+        </aside>
+
+        <main className="stage">
+          {!rec ? (
+            <div className="empty">Select a memory to begin.</div>
+          ) : (
+            <>
+              <div className="stage-head">
+                <h1>{rec.title}</h1>
+                <span className="stage-sub mono">
+                  {rec.status} · {frames.length} frames · {detail?.parts.length || 0} parts · {detail?.steps.length || 0} steps
+                </span>
+              </div>
+
+              {rec.kind === "sample" && (
+                <div className="notice">
+                  <strong>Sample memory (precomputed).</strong> The frames below are labelled diagrams, not real
+                  footage — they demonstrate the Manual, Finder, and evidence model. Upload your own teardown for
+                  live SAM 3.1 + Muse Spark analysis.
+                </div>
+              )}
+              {rec.status === "awaiting_key" && (
+                <div className="notice">
+                  Frames are extracted and ready. Set <span className="mono">MODEL_API_KEY</span> on the backend and
+                  choose <strong>Re-run analysis</strong> to build the memory with Muse Spark + SAM 3.1.
+                </div>
+              )}
+              {rec.status === "failed" && rec.error && (
+                <div className="notice">Analysis failed: {rec.error}</div>
+              )}
+              {!["ready", "awaiting_key", "failed", "sample"].includes(rec.status) && rec.kind !== "sample" && (
+                <div className="notice">Working… current stage: <span className="mono">{rec.status}</span>. This view refreshes automatically.</div>
+              )}
+
+              <div className="frame-wrap">
+                {currentFrame ? (
+                  <>
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img className="frame" src={currentFrame.url} alt={`Frame ${currentFrame.seq} at ${tc(currentFrame.ts_sec)}`} />
+                    {frameObjects.map((o) => (
+                      <div
+                        key={o.id}
+                        className="obj-box"
+                        style={{
+                          left: `${(o.x1 / o.frame_w) * 100}%`,
+                          top: `${(o.y1 / o.frame_h) * 100}%`,
+                          width: `${((o.x2 - o.x1) / o.frame_w) * 100}%`,
+                          height: `${((o.y2 - o.y1) / o.frame_h) * 100}%`,
+                        }}
+                      >
+                        <span className="obj-label">
+                          {partName(o.part_id) || o.concept}
+                          {o.confidence !== null ? ` · ${o.confidence.toFixed(2)}` : ""}
+                        </span>
+                      </div>
+                    ))}
+                    <span className="timecode">
+                      TC {tc(currentFrame.ts_sec)} · F{currentFrame.seq}
+                    </span>
+                  </>
+                ) : (
+                  <div className="frame-empty">No frames yet. Upload a recording to build a memory.</div>
+                )}
+              </div>
+
+              {frames.length > 0 && (
+                <div className="timeline">
+                  <input
+                    type="range" min={0} max={frames.length - 1} value={Math.max(0, frames.findIndex((f) => f.seq === frameSeq))}
+                    onChange={(e) => setFrameSeq(frames[Number(e.target.value)].seq)}
+                    aria-label="Scrub timeline"
+                  />
+                  <div className="strip">
+                    {frames.map((f) => (
+                      <button key={f.seq} className={f.seq === currentFrame?.seq ? "active" : ""} onClick={() => setFrameSeq(f.seq)}>
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img src={f.url} alt="" />
+                        <span className="tc">{tc(f.ts_sec)}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <div className="tabs" role="tablist">
+                {(["manual", "finder", "parts", "trace"] as const).map((t) => (
+                  <button key={t} role="tab" aria-selected={tab === t} className={`tab ${tab === t ? "active" : ""}`} onClick={() => setTab(t)}>
+                    {t === "manual" ? "Manual" : t === "finder" ? "Finder" : t === "parts" ? "Parts" : "Trace"}
+                  </button>
+                ))}
+              </div>
+
+              <div className="panel">
+                {tab === "manual" && (
+                  <>
+                    {manual.length === 0 ? (
+                      <div className="empty">No steps yet. When analysis completes, the reassembly manual appears here — teardown in reverse, each step pinned to its evidence frame.</div>
+                    ) : (
+                      manual.map((m) => (
+                        <button key={m.step_id} className={`step-card ${m.evidence_frame_seq === frameSeq ? "active" : ""}`} onClick={() => seek(m.evidence_frame_seq)}>
+                          <span className="step-num">{m.manual_order}</span>
+                          <span className="step-body">
+                            <span className="step-instruction">{m.instruction}</span>
+                            <span className="step-original" style={{ display: "block" }}>Teardown was: {m.original_action}</span>
+                            {m.state_target && <span className="step-original" style={{ display: "block" }}>Target state: {m.state_target}</span>}
+                            <span className="step-evidence">▸ evidence frame {m.evidence_frame_seq ?? "—"} · click to view</span>
+                          </span>
+                        </button>
+                      ))
+                    )}
+                  </>
+                )}
+
+                {tab === "finder" && (
+                  <>
+                    <div className="ask-row">
+                      <input
+                        value={question}
+                        onChange={(e) => setQuestion(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === "Enter") onAsk(); }}
+                        placeholder="Ask this memory… e.g. Where did I put the screw?"
+                        aria-label="Ask the memory"
+                      />
+                      <button className="btn" onClick={() => onAsk()} disabled={asking}>{asking ? "Thinking…" : "Ask"}</button>
+                    </div>
+                    <div className="ask-examples">
+                      {EXAMPLES.map((ex) => (
+                        <button key={ex} className="chip" onClick={() => { setQuestion(ex); onAsk(ex); }}>{ex}</button>
+                      ))}
+                    </div>
+                    {askResult && (
+                      <div className="answer">
+                        <div className={`verdict ${askResult.verified ? "ok" : "warn"}`}>
+                          {askResult.verified
+                            ? `✓ Verified against the memory index · source: ${askResult.source}`
+                            : "⚠ Insufficient evidence — this is not asserted as fact"}
+                        </div>
+                        <pre>{askResult.answer}</pre>
+                        {askResult.citations.length > 0 && (
+                          <div className="citations">
+                            {askResult.citations.map((c) => (
+                              <button key={c.id} className="cite-btn" onClick={() => seek(c.frame_seq)}>
+                                ▸ {c.label} · {tc(c.ts_sec)}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                    <p style={{ color: "var(--ink-soft)", fontSize: 13 }}>
+                      Answers are grounded in this recording only. Every citation is validated against the index before
+                      it is shown — an answer with no valid citation is refused, not embellished.
+                    </p>
+                  </>
+                )}
+
+                {tab === "parts" && (
+                  <>
+                    {(detail?.parts || []).length === 0 ? (
+                      <div className="empty">No parts extracted yet.</div>
+                    ) : (
+                      detail!.parts.map((p) => (
+                        <div key={p.id} className="part-row">
+                          <div className="grow">
+                            <strong>{p.name}</strong>{" "}
+                            {p.confirmed && <span className="badge sample">confirmed</span>}
+                            <div className="mono" style={{ fontSize: 11, color: "var(--ink-soft)" }}>
+                              SAM prompt: “{p.sam_prompt}” · seen {tc(p.first_seen_sec)} → {tc(p.last_seen_sec)}
+                            </div>
+                          </div>
+                          <input
+                            value={renames[p.id] ?? p.name}
+                            onChange={(e) => setRenames({ ...renames, [p.id]: e.target.value })}
+                            aria-label={`Rename ${p.name}`}
+                          />
+                          <button className="btn ghost small" onClick={() => onRename(p)}>Rename &amp; confirm</button>
+                          <button className="btn ghost small" onClick={() => seek(p.evidence_frame_seq)}>Evidence ▸</button>
+                        </div>
+                      ))
+                    )}
+                    <p style={{ color: "var(--ink-soft)", fontSize: 13 }}>
+                      Wrong label? Rename it. Human corrections are recorded in the Trace and make the memory trustworthy.
+                    </p>
+                  </>
+                )}
+
+                {tab === "trace" && (
+                  <div className="trace">
+                    {(detail?.trace || []).length === 0 ? (
+                      <div className="empty">No trace events yet.</div>
+                    ) : (
+                      detail!.trace.map((t) => (
+                        <div key={t.id} className="trace-row">
+                          <span className="trace-stage">{t.stage}</span>
+                          <span>
+                            {t.message}
+                            {t.detail ? <span style={{ color: "var(--ink-soft)" }}> — {t.detail}</span> : null}
+                          </span>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                )}
+              </div>
+
+              <div className="footer-note">
+                Built on Meta Model API — Muse Spark 1.3 reads the recording, SAM 3.1 locates parts, Muse Wonder
+                writes the reverse manual. Every answer carries its evidence.{" "}
+                {rec.kind === "sample" ? "You are viewing the labelled sample memory." : ""}
+              </div>
+            </>
+          )}
+        </main>
+      </div>
+    </div>
+  );
+}
