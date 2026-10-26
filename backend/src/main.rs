@@ -234,8 +234,8 @@ async fn manual(State(s): State<AppState>, Path(id): Path<String>) -> Response {
 }
 
 const STOPWORDS: &[&str] = &[
-    "the", "what", "when", "where", "who", "how", "why", "did", "does", "was", "were", "are",
-    "is", "put", "my", "me", "it", "this", "that", "with", "and", "for", "from", "into", "happened",
+    "the", "what", "when", "where", "who", "how", "why", "did", "does", "was", "were", "are", "is",
+    "put", "my", "me", "it", "this", "that", "with", "and", "for", "from", "into", "happened",
     "done", "back", "together", "was", "were", "been", "have", "has", "had", "you", "your",
 ];
 
