@@ -41,6 +41,28 @@ async fn cmd(args: &[&str]) -> Result<String, anyhow::Error> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
+/// Probe pixel dimensions of a media file. Returns None when probing fails.
+async fn probe_dims(path: &Path) -> Option<(i64, i64)> {
+    let out = cmd(&[
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "csv=p=0",
+        path.to_str().unwrap_or_default(),
+    ])
+    .await
+    .ok()?;
+    let mut it = out.trim().split(',');
+    let w: i64 = it.next()?.trim().parse().ok()?;
+    let h: i64 = it.next()?.trim().parse().ok()?;
+    Some((w, h))
+}
+
 pub async fn run_ingest(state: AppState, recording_id: String, video_path: PathBuf) {
     let db = state.db.clone();
     let rid = recording_id.clone();
@@ -156,15 +178,20 @@ async fn run_inner(state: AppState, rid: &str, video_path: &Path) -> Result<(), 
     if files.is_empty() {
         anyhow::bail!("ffmpeg produced no frames — is the file a supported video (mp4/mov)?");
     }
+    let (fw, fh) = probe_dims(&files[0]).await.unwrap_or((960, 540));
     {
         let c = db.lock().unwrap();
         let _ = c.execute("DELETE FROM frames WHERE recording_id=?1", params![rid]);
         for (seq, p) in files.iter().enumerate() {
             let _ = c.execute(
-                "INSERT INTO frames(recording_id,seq,ts_sec,path,width,height) VALUES(?1,?2,?3,?4,960,540)",
-                params![rid, seq as i64, seq as f64, p.to_string_lossy().to_string()],
+                "INSERT INTO frames(recording_id,seq,ts_sec,path,width,height) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![rid, seq as i64, seq as f64, p.to_string_lossy().to_string(), fw, fh],
             );
         }
+        let _ = c.execute(
+            "UPDATE recordings SET frame_w=?1, frame_h=?2 WHERE id=?3",
+            params![fw, fh, rid],
+        );
         let _ = c.execute(
             "UPDATE recordings SET duration_sec=?1, frame_count=?2 WHERE id=?3",
             params![
@@ -220,6 +247,13 @@ async fn run_inner(state: AppState, rid: &str, video_path: &Path) -> Result<(), 
         eprintln!("[ingest {}] uploading to Meta Files API...", rid);
         let file_id = state.meta.upload_file(work_path).await?;
         eprintln!("[ingest {}] upload done: {}", rid, file_id);
+        {
+            let c = db.lock().unwrap();
+            let _ = c.execute(
+                "UPDATE recordings SET meta_file_id=?1 WHERE id=?2",
+                params![file_id, rid],
+            );
+        }
         db::trace(
             &db,
             rid,

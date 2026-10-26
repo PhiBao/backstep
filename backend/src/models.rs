@@ -10,6 +10,9 @@ pub struct Recording {
     pub frame_count: i64,
     pub created_at: String,
     pub error: Option<String>,
+    pub meta_file_id: Option<String>,
+    pub frame_w: i64,
+    pub frame_h: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +103,16 @@ pub struct AskResponse {
     pub verified: bool,
     pub insufficient_evidence: bool,
     pub source: String, // "index" | "muse-wonder" | "muse-spark"
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrackRequest {
+    pub part_id: String,
+    pub frame_seq: i64,
+    pub x1: i64,
+    pub y1: i64,
+    pub x2: i64,
+    pub y2: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

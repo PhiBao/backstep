@@ -531,6 +531,153 @@ async fn ask(
     .into_response()
 }
 
+/// Mark an object with a hand-drawn box on one frame ("click to track").
+///
+/// The box is given in the frame's own pixels. SAM 3.1 segments the marked
+/// object and every match is stored as a SamObject linked to the part, which
+/// makes it a first-class citation for the Finder and the overlays.
+async fn track_object(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<TrackRequest>,
+) -> Response {
+    let rec = match db::get_recording(&s.db, &id) {
+        Some(r) => r,
+        None => return err(StatusCode::NOT_FOUND, "recording not found"),
+    };
+    let part = db::list_parts(&s.db, &id)
+        .into_iter()
+        .find(|p| p.id == body.part_id);
+    let part = match part {
+        Some(p) => p,
+        None => return err(StatusCode::NOT_FOUND, "part not found in this recording"),
+    };
+    let frame = db::list_frames(&s.db, &id)
+        .into_iter()
+        .find(|f| f.seq == body.frame_seq);
+    let frame = match frame {
+        Some(f) => f,
+        None => return err(StatusCode::NOT_FOUND, "frame not found"),
+    };
+    let (w, h) = if rec.frame_w > 0 && rec.frame_h > 0 {
+        (rec.frame_w, rec.frame_h)
+    } else {
+        (frame.width, frame.height)
+    };
+    if body.x1 < 0
+        || body.y1 < 0
+        || body.x2 <= body.x1
+        || body.y2 <= body.y1
+        || body.x2 > w
+        || body.y2 > h
+    {
+        return err(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "box [{},{},{},{}] is outside the {}x{} frame",
+                body.x1, body.y1, body.x2, body.y2, w, h
+            ),
+        );
+    }
+    let area = (body.x2 - body.x1) * (body.y2 - body.y1);
+    if area < 25 {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "box is too small — drag a larger region",
+        );
+    }
+    if area * 10 > w * h * 9 {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "box covers nearly the whole frame — mark the part, not the scene",
+        );
+    }
+    // frame.url is the API route; the file path lives in the db.
+    let bytes = match db::frame_path(&s.db, &id, body.frame_seq) {
+        Some(p) => match tokio::fs::read(&p).await {
+            Ok(b) => b,
+            Err(_) => return err(StatusCode::NOT_FOUND, "frame file missing"),
+        },
+        None => return err(StatusCode::NOT_FOUND, "frame file missing"),
+    };
+    if !s.meta.has_key() {
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "MODEL_API_KEY is not set — live tracking needs the Meta API",
+        );
+    }
+    // Single-image requests always prompt on frame 0 (SAM rejects <Nf> for
+    // images); the recording frame is tracked in our own frame_seq column.
+    let prompt = format!(
+        "<0f>1<|box;x1={};y1={};x2={};y2={};w={};h={}|>",
+        body.x1, body.y1, body.x2, body.y2, w, h
+    );
+    db::trace(
+        &s.db,
+        &id,
+        "sam-3.1",
+        &format!(
+            "Tracking \"{}\" from a hand-drawn box on frame {}",
+            part.name, frame.seq
+        ),
+        None,
+    );
+    let raw = match s.meta.sam_segment_image(&prompt, &bytes).await {
+        Ok(r) => r,
+        Err(e) => return err(StatusCode::BAD_GATEWAY, &format!("SAM 3.1 failed: {}", e)),
+    };
+    let records = crate::sam::parse_sam_text(&raw);
+    if records.is_empty() {
+        db::trace(
+            &s.db,
+            &id,
+            "sam-3.1",
+            "Hand-drawn box produced no mask",
+            None,
+        );
+        return Json(json!({"objects": [], "message": "SAM returned no mask for that box — try a tighter box on the part"}))
+            .into_response();
+    }
+    let mut out = Vec::new();
+    {
+        let c = match s.db.lock() {
+            Ok(c) => c,
+            Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "db lock"),
+        };
+        for rec in &records {
+            let oid = uuid::Uuid::new_v4().to_string();
+            let _ = c.execute(
+                "INSERT INTO sam_objects(id,recording_id,part_id,concept,frame_seq,sam_frame,object_id,x1,y1,x2,y2,frame_w,frame_h,confidence,mask_data) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                params![
+                    oid, id, part.id, format!("{} (tracked)", part.name), frame.seq,
+                    rec.sam_frame, rec.object_id, rec.x1, rec.y1, rec.x2, rec.y2,
+                    rec.frame_w, rec.frame_h, rec.confidence, rec.mask_data
+                ],
+            );
+            out.push(json!({
+                "id": oid, "concept": format!("{} (tracked)", part.name),
+                "frame_seq": frame.seq, "object_id": rec.object_id,
+                "x1": rec.x1, "y1": rec.y1, "x2": rec.x2, "y2": rec.y2,
+                "frame_w": rec.frame_w, "frame_h": rec.frame_h,
+                "confidence": rec.confidence,
+            }));
+        }
+    }
+    db::trace(
+        &s.db,
+        &id,
+        "sam-3.1",
+        &format!(
+            "Hand-drawn box \"{}\" → {} object(s) on frame {}",
+            part.name,
+            out.len(),
+            frame.seq
+        ),
+        None,
+    );
+    Json(json!({"objects": out})).into_response()
+}
+
 async fn rename_part(
     State(s): State<AppState>,
     Path(part_id): Path<String>,
@@ -600,6 +747,7 @@ async fn main() {
         .route("/api/recordings/{id}/ask", post(ask))
         .route("/api/recordings/{id}/rerun", post(rerun))
         .route("/api/parts/{part_id}", post(rename_part))
+        .route("/api/recordings/{id}/track", post(track_object))
         .layer(tower_http::cors::CorsLayer::permissive())
         .layer(DefaultBodyLimit::disable())
         .with_state(state);

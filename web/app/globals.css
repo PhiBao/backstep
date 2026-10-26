@@ -217,3 +217,13 @@ input, select { font: inherit; }
 }
 .empty { color: var(--ink-soft); border: 1.5px dashed var(--line); border-radius: var(--radius); padding: 22px; text-align: center; background: #fff; }
 .footer-note { color: var(--ink-soft); font-size: 12px; margin-top: 22px; border-top: 1px solid var(--line); padding-top: 10px; }
+
+/* ---------- click-to-track ---------- */
+.frame-wrap.tracking { border-color: var(--signal); }
+.drag-layer {
+  position: absolute; inset: 0; cursor: crosshair; touch-action: none; z-index: 3;
+}
+.drag-box {
+  position: absolute; border: 2.5px dashed var(--signal); background: rgba(255, 90, 31, 0.12);
+  border-radius: 2px; pointer-events: none; z-index: 4;
+}

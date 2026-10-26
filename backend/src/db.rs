@@ -47,6 +47,14 @@ pub fn open(path: &Path) -> anyhow::Result<Db> {
         );
         "#,
     )?;
+    // Best-effort migrations for databases created before these columns existed.
+    for stmt in [
+        "ALTER TABLE recordings ADD COLUMN meta_file_id TEXT",
+        "ALTER TABLE recordings ADD COLUMN frame_w INTEGER NOT NULL DEFAULT 960",
+        "ALTER TABLE recordings ADD COLUMN frame_h INTEGER NOT NULL DEFAULT 540",
+    ] {
+        let _ = conn.execute(stmt, []);
+    }
     Ok(Arc::new(Mutex::new(conn)))
 }
 
@@ -73,7 +81,7 @@ pub fn list_recordings(db: &Db) -> Vec<Recording> {
         Ok(c) => c,
         Err(_) => return vec![],
     };
-    let mut stmt = match c.prepare("SELECT id,title,kind,status,duration_sec,frame_count,created_at,error FROM recordings ORDER BY created_at DESC") {
+    let mut stmt = match c.prepare("SELECT id,title,kind,status,duration_sec,frame_count,created_at,error,meta_file_id,frame_w,frame_h FROM recordings ORDER BY created_at DESC") {
         Ok(s) => s, Err(_) => return vec![],
     };
     let rows = stmt.query_map([], |r| {
@@ -86,6 +94,9 @@ pub fn list_recordings(db: &Db) -> Vec<Recording> {
             frame_count: r.get(5)?,
             created_at: r.get(6)?,
             error: r.get(7)?,
+            meta_file_id: r.get(8)?,
+            frame_w: r.get(9)?,
+            frame_h: r.get(10)?,
         })
     });
     match rows {

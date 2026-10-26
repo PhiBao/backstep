@@ -68,8 +68,13 @@ export default function Home() {
   const [renames, setRenames] = useState<Record<string, string>>({});
   const [pickedFile, setPickedFile] = useState<{ name: string; size: number } | null>(null);
   const [dupTitle, setDupTitle] = useState(false);
+  const [tracking, setTracking] = useState<{ partId: string; partName: string } | null>(null);
+  const [drag, setDrag] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
+  const [trackBusy, setTrackBusy] = useState(false);
+  const [trackMsg, setTrackMsg] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const titleRef = useRef<HTMLInputElement>(null);
+  const imgRef = useRef<HTMLImageElement>(null);
 
   // Backend base URL. Empty string = same-origin Next.js proxy (fine for reads
   // and small uploads, but the proxy fails on ~100MB bodies). Set
@@ -257,6 +262,69 @@ export default function Home() {
     }
   }
 
+  function toMedia(e: React.MouseEvent): { x: number; y: number } | null {
+    const img = imgRef.current;
+    if (!img || !currentFrame) return null;
+    const r = img.getBoundingClientRect();
+    const nw = img.naturalWidth, nh = img.naturalHeight;
+    if (!nw || !nh) return null;
+    const scale = Math.min(r.width / nw, r.height / nh);
+    const dw = nw * scale, dh = nh * scale;
+    const ox = r.left + (r.width - dw) / 2, oy = r.top + (r.height - dh) / 2;
+    const dx = e.clientX - ox, dy = e.clientY - oy;
+    if (dx < 0 || dy < 0 || dx > dw || dy > dh) return null;
+    return {
+      x: Math.round((dx / scale) * (currentFrame.width / nw)),
+      y: Math.round((dy / scale) * (currentFrame.height / nh)),
+    };
+  }
+
+  function startTrack(part: Part) {
+    setTracking({ partId: part.id, partName: part.name });
+    setDrag(null);
+    setTrackMsg(null);
+    if (part.evidence_frame_seq !== null && part.evidence_frame_seq !== undefined) {
+      seek(part.evidence_frame_seq);
+    }
+  }
+
+  function cancelTrack() {
+    setTracking(null);
+    setDrag(null);
+  }
+
+  async function confirmTrack() {
+    if (!tracking || !drag || !currentFrame || !selectedId) return;
+    const x1 = Math.max(0, Math.min(drag.x0, drag.x1));
+    const y1 = Math.max(0, Math.min(drag.y0, drag.y1));
+    const x2 = Math.min(currentFrame.width, Math.max(drag.x0, drag.x1));
+    const y2 = Math.min(currentFrame.height, Math.max(drag.y0, drag.y1));
+    if (x2 - x1 < 5 || y2 - y1 < 5) {
+      setTrackMsg("That box is too small — drag a larger region around the part.");
+      return;
+    }
+    setTrackBusy(true);
+    setTrackMsg(null);
+    try {
+      const r = await fetch(api(`/api/recordings/${selectedId}/track`), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ part_id: tracking.partId, frame_seq: currentFrame.seq, x1, y1, x2, y2 }),
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || "tracking failed");
+      const n = (j.objects || []).length;
+      setTrackMsg(n > 0 ? `Tracked — SAM locked onto ${n} region${n > 1 ? "s" : ""}.` : (j.message || "No mask for that box."));
+      setTracking(null);
+      setDrag(null);
+      await loadDetail(selectedId);
+    } catch (err) {
+      setTrackMsg(err instanceof Error ? err.message : "Tracking failed. Please try again.");
+    } finally {
+      setTrackBusy(false);
+    }
+  }
+
   async function onRename(part: Part) {
     const name = (renames[part.id] ?? part.name).trim();
     if (!name || name === part.name) return;
@@ -389,7 +457,14 @@ export default function Home() {
           )}
         </aside>
 
-        <main className="stage">
+        <main
+          className="stage"
+          onKeyDown={(e) => {
+            if (e.key === "Escape" && tracking) cancelTrack();
+            if (e.key === "Enter" && tracking && drag && (e.target as HTMLElement).tagName !== "INPUT") confirmTrack();
+          }}
+          tabIndex={-1}
+        >
           {!rec ? (
             <div className="empty">Select a memory to begin.</div>
           ) : (
@@ -421,11 +496,44 @@ export default function Home() {
                 <div className="notice">Working… current stage: <span className="mono">{rec.status}</span>. This view refreshes automatically.</div>
               )}
 
-              <div className="frame-wrap">
+              {tracking && (
+                <div className="notice" style={{ borderColor: "var(--ink)" }}>
+                  <strong>Tracking “{tracking.partName}”.</strong> Drag a box around the part on this frame, then confirm.
+                  <span style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+                    <button className="btn small" onClick={confirmTrack} disabled={trackBusy || !drag}>
+                      {trackBusy ? "Tracking…" : "Confirm box"}
+                    </button>
+                    <button className="btn ghost small" onClick={cancelTrack} disabled={trackBusy}>Cancel</button>
+                  </span>
+                  {trackMsg && <div style={{ marginTop: 8 }}>{trackMsg}</div>}
+                </div>
+              )}
+              {!tracking && trackMsg && (
+                <div className="notice">{trackMsg}</div>
+              )}
+              <div className={`frame-wrap ${tracking ? "tracking" : ""}`}>
                 {currentFrame ? (
                   <>
                     {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img className="frame" src={`${BACKEND}${currentFrame.url}`} alt={`Frame ${currentFrame.seq} at ${tc(currentFrame.ts_sec)}`} />
+                    <img ref={imgRef} className="frame" src={`${BACKEND}${currentFrame.url}`} alt={`Frame ${currentFrame.seq} at ${tc(currentFrame.ts_sec)}`} draggable={false} />
+                    {tracking && (
+                      <div
+                        className="drag-layer"
+                        onMouseDown={(e) => {
+                          const p = toMedia(e);
+                          if (p) setDrag({ x0: p.x, y0: p.y, x1: p.x, y1: p.y });
+                        }}
+                        onMouseMove={(e) => {
+                          if (e.buttons !== 1) return;
+                          const p = toMedia(e);
+                          if (p) setDrag((d) => (d ? { ...d, x1: p.x, y1: p.y } : d));
+                        }}
+                        onMouseUp={(e) => {
+                          const p = toMedia(e);
+                          if (p) setDrag((d) => (d ? { ...d, x1: p.x, y1: p.y } : d));
+                        }}
+                      />
+                    )}
                     {frameObjects.map((o) => (
                       <div
                         key={o.id}
@@ -443,6 +551,17 @@ export default function Home() {
                         </span>
                       </div>
                     ))}
+                    {drag && currentFrame && (
+                      <div
+                        className="drag-box"
+                        style={{
+                          left: `${(Math.min(drag.x0, drag.x1) / currentFrame.width) * 100}%`,
+                          top: `${(Math.min(drag.y0, drag.y1) / currentFrame.height) * 100}%`,
+                          width: `${(Math.abs(drag.x1 - drag.x0) / currentFrame.width) * 100}%`,
+                          height: `${(Math.abs(drag.y1 - drag.y0) / currentFrame.height) * 100}%`,
+                        }}
+                      />
+                    )}
                     <span className="timecode">
                       TC {tc(currentFrame.ts_sec)} · F{currentFrame.seq}
                     </span>
@@ -564,6 +683,13 @@ export default function Home() {
                           />
                           <button className="btn ghost small" onClick={() => onRename(p)}>Rename &amp; confirm</button>
                           <button className="btn ghost small" onClick={() => seek(p.evidence_frame_seq)}>Evidence ▸</button>
+                          <button
+                            className="btn ghost small"
+                            onClick={() => (tracking?.partId === p.id ? cancelTrack() : startTrack(p))}
+                            title="Draw a box on the frame so SAM can lock onto this part"
+                          >
+                            {tracking?.partId === p.id ? "Tracking… ×" : "Track ▣"}
+                          </button>
                         </div>
                       ))
                     )}
