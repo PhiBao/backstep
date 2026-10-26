@@ -66,8 +66,63 @@ export default function Home() {
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [renames, setRenames] = useState<Record<string, string>>({});
+  const [pickedFile, setPickedFile] = useState<{ name: string; size: number } | null>(null);
+  const [dupTitle, setDupTitle] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const titleRef = useRef<HTMLInputElement>(null);
+
+  const MAX_BYTES = 200 * 1024 * 1024;
+  const fmtSize = (n: number) =>
+    n >= 1024 * 1024 ? `${(n / (1024 * 1024)).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`;
+
+  function onPickFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const f = e.target.files?.[0];
+    setDupTitle(false);
+    if (!f) {
+      setPickedFile(null);
+      return;
+    }
+    if (!/\.(mp4|mov)$/i.test(f.name)) {
+      setUploadError("Only .mp4 or .mov recordings are supported.");
+      setPickedFile(null);
+      if (fileRef.current) fileRef.current.value = "";
+      return;
+    }
+    if (f.size > MAX_BYTES) {
+      setUploadError(`That file is ${fmtSize(f.size)} — the limit is 200 MB. Trim it or export at a lower bitrate first.`);
+      setPickedFile(null);
+      if (fileRef.current) fileRef.current.value = "";
+      return;
+    }
+    setUploadError(null);
+    setPickedFile({ name: f.name, size: f.size });
+    const titleEl = titleRef.current;
+    if (titleEl && !titleEl.value.trim()) {
+      titleEl.value = f.name.replace(/\.(mp4|mov)$/i, "").replace(/[_-]+/g, " ").trim();
+    }
+  }
+
+  async function postUpload(title: string): Promise<Recording> {
+    const file = fileRef.current?.files?.[0];
+    if (!file) throw new Error("Choose a video file first.");
+    const fd = new FormData();
+    fd.append("file", file);
+    if (title) fd.append("title", title);
+    const r = await fetch("/api/recordings", { method: "POST", body: fd });
+    const text = await r.text();
+    let j: { recording?: Recording; error?: string } = {};
+    try {
+      j = text ? (JSON.parse(text) as typeof j) : {};
+    } catch {
+      throw new Error(
+        r.ok
+          ? "The server returned an unreadable response. Please try again."
+          : `Upload failed (HTTP ${r.status}). The server may have restarted mid-upload — please try again.`
+      );
+    }
+    if (!r.ok || !j.recording) throw new Error(j.error || `Upload failed (HTTP ${r.status}). Please try again.`);
+    return j.recording;
+  }
 
   const loadRecordings = useCallback(async () => {
     try {
@@ -146,23 +201,32 @@ export default function Home() {
   async function onUpload(e: React.FormEvent) {
     e.preventDefault();
     const file = fileRef.current?.files?.[0];
-    if (!file) return;
+    if (!file) {
+      setUploadError("Choose a video file first.");
+      return;
+    }
+    const title = titleRef.current?.value?.trim() || file.name.replace(/\.(mp4|mov)$/i, "");
+    const clash = recordings.find((r) => r.title.trim().toLowerCase() === title.toLowerCase());
+    if (clash && !dupTitle) {
+      setDupTitle(true);
+      return;
+    }
     setUploading(true);
     setUploadError(null);
     try {
-      const fd = new FormData();
-      fd.append("file", file);
-      const t = titleRef.current?.value?.trim();
-      if (t) fd.append("title", t);
-      const r = await fetch("/api/recordings", { method: "POST", body: fd });
-      const j = await r.json();
-      if (!r.ok) throw new Error(j.error || "upload failed");
-      await loadRecordings();
-      setSelectedId(j.recording.id);
+      if (clash && dupTitle) {
+        await fetch(`/api/recordings/${clash.id}`, { method: "DELETE" });
+      }
+      const rec = await postUpload(title);
+      const recs = await loadRecordings();
+      if (!recs.find((r: Recording) => r.id === rec.id)) setRecordings([rec, ...recs]);
+      setSelectedId(rec.id);
       if (fileRef.current) fileRef.current.value = "";
       if (titleRef.current) titleRef.current.value = "";
+      setPickedFile(null);
+      setDupTitle(false);
     } catch (err) {
-      setUploadError(err instanceof Error ? err.message : "upload failed");
+      setUploadError(err instanceof Error ? err.message : "Upload failed. Please try again.");
     } finally {
       setUploading(false);
     }
@@ -262,13 +326,42 @@ export default function Home() {
               <div style={{ fontSize: 13 }}>
                 Film yourself taking something apart (.mp4 / .mov, ≤ 200 MB). Backstep extracts the parts and steps.
               </div>
-              <input ref={titleRef} type="text" placeholder="Title (optional)" aria-label="Recording title" />
-              <input ref={fileRef} type="file" accept="video/mp4,video/quicktime,.mp4,.mov" aria-label="Video file" required />
-              <div style={{ marginTop: 10, display: "flex", gap: 8 }}>
-                <button className="btn small" type="submit" disabled={uploading}>
+              <input ref={titleRef} type="text" placeholder="Title (optional — defaults to filename)" aria-label="Recording title" />
+              <div className="file-row">
+                <button type="button" className="file-btn" onClick={() => fileRef.current?.click()} disabled={uploading}>
+                  Choose file
+                </button>
+                <span className={`file-name ${pickedFile ? "has-file" : ""}`} title={pickedFile?.name || ""}>
+                  {pickedFile ? `${pickedFile.name} · ${fmtSize(pickedFile.size)}` : "No file chosen"}
+                </span>
+              </div>
+              <input
+                ref={fileRef}
+                type="file"
+                accept="video/mp4,video/quicktime,.mp4,.mov"
+                aria-label="Video file"
+                onChange={onPickFile}
+                style={{ position: "absolute", width: 1, height: 1, opacity: 0, pointerEvents: "none" }}
+                tabIndex={-1}
+              />
+              <div className="upload-actions">
+                <button className="btn small" type="submit" disabled={uploading || !pickedFile}>
                   {uploading ? "Uploading…" : "Build memory"}
                 </button>
               </div>
+              {dupTitle && (
+                <div className="dup-box">
+                  A memory with this title already exists. Replace it with the new recording?
+                  <div className="row">
+                    <button className="btn small" type="submit" disabled={uploading}>
+                      {uploading ? "Replacing…" : "Replace it"}
+                    </button>
+                    <button className="btn ghost small" type="button" onClick={() => setDupTitle(false)} disabled={uploading}>
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
               {uploadError && <div style={{ color: "var(--danger)", fontSize: 13, marginTop: 8 }}>{uploadError}</div>}
               {!health?.meta_api_configured && (
                 <div style={{ fontSize: 12, color: "var(--ink-soft)", marginTop: 8 }}>
