@@ -7,7 +7,7 @@ mod sample;
 
 use axum::{
     body::Body,
-    extract::{Multipart, Path, State},
+    extract::{DefaultBodyLimit, Multipart, Path, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -588,6 +588,7 @@ async fn main() {
         .route("/api/recordings/{id}/rerun", post(rerun))
         .route("/api/parts/{part_id}", post(rename_part))
         .layer(tower_http::cors::CorsLayer::permissive())
+        .layer(DefaultBodyLimit::disable())
         .with_state(state);
 
     let port: u16 = std::env::var("PORT")

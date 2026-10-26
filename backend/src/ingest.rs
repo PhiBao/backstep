@@ -162,7 +162,9 @@ async fn run_inner(state: AppState, rid: &str, video_path: &Path) -> Result<(), 
             "Uploading video to Meta Files API",
             None,
         );
+        eprintln!("[ingest {}] uploading to Meta Files API...", rid);
         let file_id = state.meta.upload_file(video_path).await?;
+        eprintln!("[ingest {}] upload done: {}", rid, file_id);
         db::trace(
             &db,
             rid,
@@ -226,14 +228,16 @@ async fn run_inner(state: AppState, rid: &str, video_path: &Path) -> Result<(), 
         let ev_seq = step
             .evidence_sec
             .and_then(|s| db::frame_seq_at(&db, rid, s));
-        let c = db.lock().unwrap();
-        let _ = c.execute(
-            "INSERT INTO steps(id,recording_id,order_index,start_sec,end_sec,action,part_names,state_before,state_after,evidence_frame_seq) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-            params![
-                uuid::Uuid::new_v4().to_string(), rid, i as i64, step.start_sec, step.end_sec,
-                step.action, serde_json::to_string(&step.part_names)?, step.state_before, step.state_after, ev_seq
-            ],
-        );
+        {
+            let c = db.lock().unwrap();
+            let _ = c.execute(
+                "INSERT INTO steps(id,recording_id,order_index,start_sec,end_sec,action,part_names,state_before,state_after,evidence_frame_seq) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                params![
+                    uuid::Uuid::new_v4().to_string(), rid, i as i64, step.start_sec, step.end_sec,
+                    step.action, serde_json::to_string(&step.part_names)?, step.state_before, step.state_after, ev_seq
+                ],
+            );
+        }
     }
 
     // --- SAM 3.1 segmentation on evidence frames ---
@@ -291,15 +295,17 @@ async fn run_inner(state: AppState, rid: &str, video_path: &Path) -> Result<(), 
             );
             continue;
         }
-        let c = db.lock().unwrap();
-        for rec in &records {
-            let _ = c.execute(
-                "INSERT INTO sam_objects(id,recording_id,part_id,concept,frame_seq,sam_frame,object_id,x1,y1,x2,y2,frame_w,frame_h,confidence,mask_data) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
-                params![
-                    uuid::Uuid::new_v4().to_string(), rid, pid, prompt, seq, rec.sam_frame, rec.object_id,
-                    rec.x1, rec.y1, rec.x2, rec.y2, rec.frame_w, rec.frame_h, rec.confidence, rec.mask_data
-                ],
-            );
+        {
+            let c = db.lock().unwrap();
+            for rec in &records {
+                let _ = c.execute(
+                    "INSERT INTO sam_objects(id,recording_id,part_id,concept,frame_seq,sam_frame,object_id,x1,y1,x2,y2,frame_w,frame_h,confidence,mask_data) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                    params![
+                        uuid::Uuid::new_v4().to_string(), rid, pid, prompt, seq, rec.sam_frame, rec.object_id,
+                        rec.x1, rec.y1, rec.x2, rec.y2, rec.frame_w, rec.frame_h, rec.confidence, rec.mask_data
+                    ],
+                );
+            }
         }
         db::trace(
             &db,
@@ -346,13 +352,15 @@ async fn run_inner(state: AppState, rid: &str, video_path: &Path) -> Result<(), 
             {
                 Ok(v) => {
                     if let Some(arr) = v.get("reverse_steps").and_then(|x| x.as_array()) {
-                        let c = db.lock().unwrap();
-                        for item in arr {
-                            if let (Some(idx), Some(txt)) = (
-                                item.get("order_index").and_then(|x| x.as_i64()),
-                                item.get("reverse_action").and_then(|x| x.as_str()),
-                            ) {
-                                let _ = c.execute("UPDATE steps SET reverse_action=?1 WHERE recording_id=?2 AND order_index=?3", params![txt, rid, idx]);
+                        {
+                            let c = db.lock().unwrap();
+                            for item in arr {
+                                if let (Some(idx), Some(txt)) = (
+                                    item.get("order_index").and_then(|x| x.as_i64()),
+                                    item.get("reverse_action").and_then(|x| x.as_str()),
+                                ) {
+                                    let _ = c.execute("UPDATE steps SET reverse_action=?1 WHERE recording_id=?2 AND order_index=?3", params![txt, rid, idx]);
+                                }
                             }
                         }
                         applied = true;
@@ -379,16 +387,18 @@ async fn run_inner(state: AppState, rid: &str, video_path: &Path) -> Result<(), 
         }
         if !applied {
             // Deterministic fallback, clearly a template — never presented as model output.
-            let c = db.lock().unwrap();
-            for s in &steps_now {
-                let _ = c.execute(
-                    "UPDATE steps SET reverse_action=?1 WHERE recording_id=?2 AND order_index=?3",
-                    params![
-                        format!("Reverse this teardown step: {}", s.action),
-                        rid,
-                        s.order_index
-                    ],
-                );
+            {
+                let c = db.lock().unwrap();
+                for s in &steps_now {
+                    let _ = c.execute(
+                        "UPDATE steps SET reverse_action=?1 WHERE recording_id=?2 AND order_index=?3",
+                        params![
+                            format!("Reverse this teardown step: {}", s.action),
+                            rid,
+                            s.order_index
+                        ],
+                    );
+                }
             }
             db::trace(
                 &db,

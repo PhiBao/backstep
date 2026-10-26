@@ -15,7 +15,11 @@ impl MetaClient {
         Self {
             base: base.trim_end_matches('/').to_string(),
             key: key.filter(|k| !k.trim().is_empty()),
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(15))
+                .timeout(std::time::Duration::from_secs(600))
+                .build()
+                .expect("reqwest client"),
         }
     }
 
