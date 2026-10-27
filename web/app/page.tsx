@@ -16,6 +16,10 @@ type Step = {
   id: string; order_index: number; start_sec: number; end_sec: number; action: string;
   reverse_action: string | null; part_names: string[];
   state_before: string | null; state_after: string | null; evidence_frame_seq: number | null;
+  detail?: {
+    tools?: string[]; orientation?: string | null; warnings?: string[];
+    part_count?: number | null; uncertain?: boolean; note?: string | null;
+  } | null;
 };
 type SamObject = {
   id: string; part_id: string | null; concept: string; frame_seq: number; object_id: number;
@@ -59,7 +63,12 @@ export default function Home() {
   const [detail, setDetail] = useState<Detail | null>(null);
   const [manual, setManual] = useState<ManualStep[]>([]);
   const [frameSeq, setFrameSeq] = useState<number>(0);
-  const [tab, setTab] = useState<"manual" | "finder" | "parts" | "trace">("manual");
+  const [tab, setTab] = useState<"guide" | "manual" | "finder" | "parts" | "trace">("manual");
+  const [guideIdx, setGuideIdx] = useState(0);
+  const [guideDone, setGuideDone] = useState<Record<string, boolean>>({});
+  const [checkResult, setCheckResult] = useState<{ verdict: string; explanation: string; confidence: number } | null>(null);
+  const [checkBusy, setCheckBusy] = useState(false);
+  const checkFileRef = useRef<HTMLInputElement>(null);
   const [question, setQuestion] = useState("");
   const [askResult, setAskResult] = useState<AskResponse | null>(null);
   const [asking, setAsking] = useState(false);
@@ -347,6 +356,52 @@ export default function Home() {
     setSelectedId(recs[0]?.id || "");
   }
 
+  useEffect(() => {
+    if (!selectedId) return;
+    try {
+      const raw = localStorage.getItem(`backstep-guide-${selectedId}`);
+      setGuideDone(raw ? (JSON.parse(raw) as Record<string, boolean>) : {});
+    } catch {
+      setGuideDone({});
+    }
+    setGuideIdx(0);
+    setCheckResult(null);
+  }, [selectedId]);
+
+  const guideSteps = useMemo(() => {
+    const steps = [...(detail?.steps || [])].sort((a, b) => b.order_index - a.order_index);
+    return steps;
+  }, [detail]);
+
+  function markDone(stepId: string) {
+    if (!selectedId) return;
+    const next = { ...guideDone, [stepId]: true };
+    setGuideDone(next);
+    try {
+      localStorage.setItem(`backstep-guide-${selectedId}`, JSON.stringify(next));
+    } catch { /* private mode */ }
+  }
+
+  async function onCheckPhoto(stepId: string, file: File) {
+    if (!selectedId) return;
+    setCheckBusy(true);
+    setCheckResult(null);
+    try {
+      const fd = new FormData();
+      fd.append("step_id", stepId);
+      fd.append("file", file);
+      const r = await fetch(api(`/api/recordings/${selectedId}/check`), { method: "POST", body: fd });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || "check failed");
+      setCheckResult(j);
+      if (j.verdict === "matches") markDone(stepId);
+    } catch (err) {
+      setCheckResult({ verdict: "unsure", explanation: err instanceof Error ? err.message : "Check failed.", confidence: 0 });
+    } finally {
+      setCheckBusy(false);
+    }
+  }
+
   const rec = detail?.recording;
 
   return (
@@ -591,14 +646,111 @@ export default function Home() {
               )}
 
               <div className="tabs" role="tablist">
-                {(["manual", "finder", "parts", "trace"] as const).map((t) => (
+                {(["guide", "manual", "finder", "parts", "trace"] as const).map((t) => (
                   <button key={t} role="tab" aria-selected={tab === t} className={`tab ${tab === t ? "active" : ""}`} onClick={() => setTab(t)}>
-                    {t === "manual" ? "Manual" : t === "finder" ? "Finder" : t === "parts" ? "Parts" : "Trace"}
+                    {t === "guide" ? "Guide ▸" : t === "manual" ? "Manual" : t === "finder" ? "Finder" : t === "parts" ? "Parts" : "Trace"}
                   </button>
                 ))}
               </div>
 
               <div className="panel">
+                {tab === "guide" && (
+                  <>
+                    {guideSteps.length === 0 ? (
+                      <div className="empty">No steps yet. When the memory is ready, guided reassembly walks you through putting it back together — one step at a time.</div>
+                    ) : (
+                      (() => {
+                        const idx = Math.min(guideIdx, guideSteps.length - 1);
+                        const step = guideSteps[idx];
+                        const orig = [...(detail?.steps || [])].sort((a, b) => a.order_index - b.order_index);
+                        const manualOrder = orig.length - (step?.order_index ?? 0);
+                        const d = step?.detail || undefined;
+                        const doneCount = guideSteps.filter((st) => guideDone[st.id]).length;
+                        return (
+                          <div className="guide">
+                            <div className="guide-progress">
+                              <span className="mono">STEP {idx + 1} / {guideSteps.length}</span>
+                              <span className="mono">{doneCount} done</span>
+                            </div>
+                            <div className="guide-bar"><div style={{ width: `${(doneCount / guideSteps.length) * 100}%` }} /></div>
+                            <div className="guide-card">
+                              <div className="guide-instruction">
+                                {step?.reverse_action || (step ? `Reverse: ${step.action}` : "")}
+                              </div>
+                              {step && <div className="guide-original">Teardown was: {step.action}</div>}
+                              {step?.state_before && <div className="guide-target">Target: {step.state_before}</div>}
+                              {d?.uncertain && <div className="guide-warn">⚠ Uncertain — the memory is not sure about this step. Trust your eyes.</div>}
+                              {d?.warnings && d.warnings.length > 0 && (
+                                <div className="guide-warn">⚠ {d.warnings.join(" · ")}</div>
+                              )}
+                              {d?.orientation && <div className="guide-note">Orientation: {d.orientation}</div>}
+                              {d?.tools && d.tools.length > 0 && (
+                                <div className="guide-note">Tools: {d.tools.join(", ")}</div>
+                              )}
+                              {d?.note && <div className="guide-note">{d.note}</div>}
+                              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 12 }}>
+                                <button className="btn ghost" onClick={() => seek(step?.evidence_frame_seq ?? null)}>
+                                  Show evidence frame ▸
+                                </button>
+                                <button className="btn ghost" onClick={() => checkFileRef.current?.click()} disabled={checkBusy || !step}>
+                                  {checkBusy ? "Checking…" : "Check my work 📷"}
+                                </button>
+                                <input
+                                  ref={checkFileRef}
+                                  type="file"
+                                  accept="image/*"
+                                  capture="environment"
+                                  style={{ position: "absolute", width: 1, height: 1, opacity: 0, pointerEvents: "none" }}
+                                  tabIndex={-1}
+                                  onChange={(e) => {
+                                    const f = e.target.files?.[0];
+                                    if (f && step) onCheckPhoto(step.id, f);
+                                    e.target.value = "";
+                                  }}
+                                />
+                              </div>
+                              {checkResult && (
+                                <div className={`guide-verdict ${checkResult.verdict}`}>
+                                  <strong>{checkResult.verdict === "matches" ? "✓ Looks right" : checkResult.verdict === "not_yet" ? "Not yet" : "Can't tell"}</strong>
+                                  {" — "}{checkResult.explanation}
+                                  <span className="mono"> ({checkResult.confidence.toFixed(2)})</span>
+                                </div>
+                              )}
+                              <div className="guide-nav">
+                                <button className="btn ghost big" disabled={idx === 0} onClick={() => { setGuideIdx(idx - 1); setCheckResult(null); }}>
+                                  ← Back
+                                </button>
+                                <button
+                                  className="btn big"
+                                  onClick={() => {
+                                    if (step) markDone(step.id);
+                                    setCheckResult(null);
+                                    if (idx < guideSteps.length - 1) setGuideIdx(idx + 1);
+                                  }}
+                                >
+                                  {idx >= guideSteps.length - 1 ? (guideDone[step?.id || ""] ? "Done ✓" : "Mark done ✓") : "Done — next step →"}
+                                </button>
+                              </div>
+                              <div className="guide-dots">
+                                {guideSteps.map((st, i) => (
+                                  <button
+                                    key={st.id}
+                                    className={`guide-dot ${i === idx ? "now" : ""} ${guideDone[st.id] ? "done" : ""}`}
+                                    onClick={() => { setGuideIdx(i); setCheckResult(null); seek(st.evidence_frame_seq); }}
+                                    aria-label={`Go to step ${i + 1}`}
+                                  >
+                                    {i + 1}
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })()
+                    )}
+                  </>
+                )}
+
                 {tab === "manual" && (
                   <>
                     {manual.length === 0 ? (
@@ -611,6 +763,18 @@ export default function Home() {
                             <span className="step-instruction">{m.instruction}</span>
                             <span className="step-original" style={{ display: "block" }}>Teardown was: {m.original_action}</span>
                             {m.state_target && <span className="step-original" style={{ display: "block" }}>Target state: {m.state_target}</span>}
+                            {(() => {
+                              const d = detail?.steps.find((st) => st.id === m.step_id)?.detail;
+                              if (!d) return null;
+                              return (
+                                <span className="step-original" style={{ display: "block" }}>
+                                  {d.uncertain ? "⚠ uncertain · " : ""}
+                                  {d.tools && d.tools.length > 0 ? `tools: ${d.tools.join(", ")} · ` : ""}
+                                  {d.orientation ? `orientation: ${d.orientation} · ` : ""}
+                                  {d.warnings && d.warnings.length > 0 ? `⚠ ${d.warnings.join("; ")}` : ""}
+                                </span>
+                              );
+                            })()}
                             <span className="step-evidence">▸ evidence frame {m.evidence_frame_seq ?? "—"} · click to view</span>
                           </span>
                         </button>
@@ -675,6 +839,19 @@ export default function Home() {
                             <div className="mono" style={{ fontSize: 11, color: "var(--ink-soft)" }}>
                               SAM prompt: “{p.sam_prompt}” · seen {tc(p.first_seen_sec)} → {tc(p.last_seen_sec)}
                             </div>
+                            {(() => {
+                              const sight = (detail?.objects || []).filter((o) => o.part_id === p.id);
+                              const frames = [...new Set(sight.map((o) => o.frame_seq))].sort((a, b) => a - b);
+                              if (frames.length === 0) return null;
+                              return (
+                                <div style={{ marginTop: 6, display: "flex", gap: 5, flexWrap: "wrap", alignItems: "center" }}>
+                                  <span className="mono" style={{ fontSize: 11, color: "var(--teal)" }}>sightings:</span>
+                                  {frames.map((f) => (
+                                    <button key={f} className="cite-btn" onClick={() => seek(f)}>F{f} · {tc(frames.length ? (detail?.frames.find((fr) => fr.seq === f)?.ts_sec ?? null) : null)}</button>
+                                  ))}
+                                </div>
+                              );
+                            })()}
                           </div>
                           <input
                             value={renames[p.id] ?? p.name}

@@ -138,6 +138,58 @@ Use only what is visible in the video. Do not invent parts or steps.";
         Ok(extract_responses_text(&v).unwrap_or_default())
     }
 
+    /// Image understanding with schema-constrained JSON output (Responses API).
+    pub async fn responses_image_json(
+        &self,
+        prompt: &str,
+        jpeg_bytes: &[u8],
+        schema_name: &str,
+        schema: Value,
+    ) -> Result<Value, anyhow::Error> {
+        let data_url = format!("data:image/jpeg;base64,{}", STANDARD.encode(jpeg_bytes));
+        let body = json!({
+            "model": "muse-spark-1.3",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {"type": "input_image", "image_url": data_url}
+                ]
+            }],
+            "text": {"format": {"type": "json_schema", "name": schema_name, "schema": schema}}
+        });
+        let v = self.post_json("/responses", body).await?;
+        let text = extract_responses_text(&v)
+            .ok_or_else(|| anyhow::anyhow!("image response had no output text"))?;
+        Ok(serde_json::from_str(strip_fences(&text))?)
+    }
+
+    /// Check a user photo against a reassembly step's target state.
+    pub async fn check_step_photo(
+        &self,
+        jpeg_bytes: &[u8],
+        instruction: &str,
+        target_state: &str,
+        original_action: &str,
+    ) -> Result<Value, anyhow::Error> {
+        let schema = json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {
+                "verdict": {"type": "string", "enum": ["matches", "not_yet", "unsure"]},
+                "explanation": {"type": "string"},
+                "confidence": {"type": "number"}
+            },
+            "required": ["verdict", "explanation", "confidence"]
+        });
+        let prompt = format!(
+            "A person is reassembling something by hand. Their current step is: \"{}\" The target state after this step is: \"\"\"{}\"\"\" (the teardown step was: \"{}\"). Look at the photo. Verdict: \"matches\" if the photo clearly shows the target state, \"not_yet\" if it clearly is not there yet, \"unsure\" if you cannot tell from this angle. One short explanation sentence, concrete and visual.",
+            instruction, target_state, original_action
+        );
+        self.responses_image_json(&prompt, jpeg_bytes, "step_check", schema)
+            .await
+    }
+
     /// Chat JSON with schema constraint. `model` is tried first; caller handles fallback.
     pub async fn chat_json(
         &self,

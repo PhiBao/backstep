@@ -303,22 +303,61 @@ async fn ask(
             if sc > 0 {
                 let obj = objects
                     .iter()
-                    .find(|o| o.part_id.as_deref() == Some(part.id.as_str()));
+                    .filter(|o| o.part_id.as_deref() == Some(part.id.as_str()))
+                    .find(|o| Some(o.frame_seq) == part.evidence_frame_seq)
+                    .or_else(|| {
+                        objects
+                            .iter()
+                            .filter(|o| o.part_id.as_deref() == Some(part.id.as_str()))
+                            .max_by_key(|o| o.frame_seq)
+                    });
                 let frame_seq = obj.map(|o| o.frame_seq).or(part.evidence_frame_seq);
                 let ts = obj
                     .and_then(|_| frame_ts(&s.db, &id, frame_seq))
                     .or(part.last_seen_sec);
-                let citations = vec![Citation {
+                let mut citations = vec![Citation {
                     kind: "object".to_string(),
                     id: obj.map(|o| o.id.clone()).unwrap_or_else(|| part.id.clone()),
                     frame_seq,
                     ts_sec: ts,
                     label: format!("{} — evidence frame", part.name),
                 }];
+                let mut sightings: Vec<&SamObject> = objects
+                    .iter()
+                    .filter(|o| o.part_id.as_deref() == Some(part.id.as_str()))
+                    .collect();
+                sightings.sort_by_key(|o| o.frame_seq);
+                let sighting_count = sightings
+                    .iter()
+                    .map(|o| o.frame_seq)
+                    .collect::<HashSet<i64>>()
+                    .len();
+                let mut cited_frames: HashSet<i64> = frame_seq.into_iter().collect();
+                for o in sightings
+                    .iter()
+                    .filter(|o| Some(o.frame_seq) != frame_seq && cited_frames.insert(o.frame_seq))
+                    .take(5)
+                {
+                    citations.push(Citation {
+                        kind: "object".to_string(),
+                        id: o.id.clone(),
+                        frame_seq: Some(o.frame_seq),
+                        ts_sec: frame_ts(&s.db, &id, Some(o.frame_seq)),
+                        label: format!("{} — sighting", part.name),
+                    });
+                }
                 let has_box = obj.is_some();
+                let sighting_note = if sighting_count > 1 {
+                    format!(
+                        " It appears in {} tracked frames — every sighting is cited below.",
+                        sighting_count
+                    )
+                } else {
+                    String::new()
+                };
                 return Json(AskResponse {
                     answer: format!(
-                        "The {} was last clearly seen at {} — frame {} in this recording.{}",
+                        "The {} was last clearly seen at {} — frame {} in this recording.{}{}",
                         part.name,
                         ts.map(|t| format!("{:.0}s", t))
                             .unwrap_or_else(|| "an unknown time".into()),
@@ -329,7 +368,8 @@ async fn ask(
                             " Its tracked region is highlighted on that frame."
                         } else {
                             ""
-                        }
+                        },
+                        sighting_note
                     ),
                     citations,
                     verified: true,
@@ -529,6 +569,96 @@ async fn ask(
         citations: vec![], verified: false, insufficient_evidence: true, source: "index".into(),
     })
     .into_response()
+}
+
+/// Check-my-work: compare a user's photo against a reassembly step's
+/// target state (Muse Spark image understanding). Advisory verdict only.
+async fn check_step(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    mut mp: Multipart,
+) -> Response {
+    if db::get_recording(&s.db, &id).is_none() {
+        return err(StatusCode::NOT_FOUND, "recording not found");
+    }
+    let mut step_id: Option<String> = None;
+    let mut file_bytes: Option<Vec<u8>> = None;
+    while let Ok(Some(field)) = mp.next_field().await {
+        match field.name() {
+            Some("step_id") => step_id = field.text().await.ok(),
+            Some("file") => {
+                if let Ok(b) = field.bytes().await {
+                    file_bytes = Some(b.to_vec());
+                }
+            }
+            _ => {}
+        }
+    }
+    let step_id = match step_id {
+        Some(v) if !v.trim().is_empty() => v,
+        _ => return err(StatusCode::BAD_REQUEST, "step_id is required"),
+    };
+    let bytes = match file_bytes {
+        Some(b) if !b.is_empty() => b,
+        _ => return err(StatusCode::BAD_REQUEST, "a photo file is required"),
+    };
+    if bytes.len() > 20 * 1024 * 1024 {
+        return err(StatusCode::PAYLOAD_TOO_LARGE, "photo exceeds 20 MB");
+    }
+    let step = db::list_steps(&s.db, &id)
+        .into_iter()
+        .find(|st| st.id == step_id);
+    let step = match step {
+        Some(st) => st,
+        None => return err(StatusCode::NOT_FOUND, "step not found in this recording"),
+    };
+    if !s.meta.has_key() {
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "MODEL_API_KEY is not set — check-my-work needs the Meta API",
+        );
+    }
+    let instruction = step
+        .reverse_action
+        .clone()
+        .unwrap_or_else(|| format!("Reverse: {}", step.action));
+    let target = step
+        .state_before
+        .clone()
+        .or(step.state_after.clone())
+        .unwrap_or_else(|| instruction.clone());
+    match s
+        .meta
+        .check_step_photo(&bytes, &instruction, &target, &step.action)
+        .await
+    {
+        Ok(v) => {
+            let verdict = v
+                .get("verdict")
+                .and_then(|x| x.as_str())
+                .unwrap_or("unsure")
+                .to_string();
+            db::trace(
+                &s.db,
+                &id,
+                "guide",
+                &format!(
+                    "Check-my-work on step {}: {}",
+                    step.order_index + 1,
+                    verdict
+                ),
+                None,
+            );
+            Json(json!({
+                "step_id": step.id,
+                "verdict": verdict,
+                "explanation": v.get("explanation").and_then(|x| x.as_str()).unwrap_or(""),
+                "confidence": v.get("confidence").and_then(|x| x.as_f64()).unwrap_or(0.0),
+            }))
+            .into_response()
+        }
+        Err(e) => err(StatusCode::BAD_GATEWAY, &format!("check failed: {}", e)),
+    }
 }
 
 /// Mark an object with a hand-drawn box on one frame ("click to track").
@@ -748,6 +878,7 @@ async fn main() {
         .route("/api/recordings/{id}/rerun", post(rerun))
         .route("/api/parts/{part_id}", post(rename_part))
         .route("/api/recordings/{id}/track", post(track_object))
+        .route("/api/recordings/{id}/check", post(check_step))
         .layer(tower_http::cors::CorsLayer::permissive())
         .layer(DefaultBodyLimit::disable())
         .with_state(state);

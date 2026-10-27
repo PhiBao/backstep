@@ -50,6 +50,8 @@ pub struct Step {
     pub state_before: Option<String>,
     pub state_after: Option<String>,
     pub evidence_frame_seq: Option<i64>,
+    #[serde(default)]
+    pub detail: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

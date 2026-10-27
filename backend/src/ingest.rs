@@ -341,6 +341,7 @@ async fn run_inner(state: AppState, rid: &str, video_path: &Path) -> Result<(), 
 
     // --- Retry zero-match parts with simplified prompts on nearby frames ---
     retry_zero_match_parts(&state, &db, rid).await;
+    build_sightings(&state, &db, rid).await;
 
     // --- Reverse manual synthesis (Muse Wonder, Spark fallback) ---
     let steps_now = db::list_steps(&db, rid);
@@ -430,6 +431,8 @@ async fn run_inner(state: AppState, rid: &str, video_path: &Path) -> Result<(), 
             );
         }
     }
+
+    enrich_steps(&state, &db, rid).await;
 
     db::set_status(&db, rid, "ready", None);
     db::trace(
@@ -636,17 +639,34 @@ async fn retry_zero_match_parts(state: &AppState, db: &db::Db, rid: &str) {
             .get(&part.name.to_lowercase())
             .cloned()
             .unwrap_or_default();
-        if let Some(head) = part
+        // Deterministic candidates from the prompt's own words — model
+        // variants vary run to run, these do not: head noun, first+head
+        // ("brass block"), and the last two words ("movement block").
+        let words: Vec<&str> = part
             .sam_prompt
             .split(|c: char| !c.is_alphanumeric())
             .filter(|t| t.len() > 2)
-            .last()
-        {
-            if !vars.iter().any(|v| v.eq_ignore_ascii_case(head)) {
-                vars.push(head.to_string());
+            .collect();
+        let mut det: Vec<String> = Vec::new();
+        if let (Some(first), Some(last)) = (words.first(), words.last()) {
+            if first != last {
+                det.push(format!("{} {}", first, last));
+            }
+            det.push(last.to_string());
+        }
+        if words.len() >= 2 {
+            det.push(format!(
+                "{} {}",
+                words[words.len() - 2],
+                words[words.len() - 1]
+            ));
+        }
+        for cand in det {
+            if !vars.iter().any(|v| v.eq_ignore_ascii_case(&cand)) {
+                vars.push(cand);
             }
         }
-        vars.truncate(3);
+        vars.truncate(5);
         if vars.is_empty() {
             continue;
         }
@@ -691,6 +711,165 @@ async fn retry_zero_match_parts(state: &AppState, db: &db::Db, rid: &str) {
                 }
             }
         }
+    }
+}
+
+/// Sample additional frames across each part's seen-range and segment them
+/// with the prompt that already worked. Turns a single evidence frame into a
+/// sighting timeline. Bounded and cached like every other SAM call.
+async fn build_sightings(state: &AppState, db: &db::Db, rid: &str) {
+    let parts = db::list_parts(db, rid);
+    let objects = db::list_objects(db, rid);
+    let frames = db::list_frames(db, rid);
+    if frames.is_empty() {
+        return;
+    }
+    let mut added = 0usize;
+    for part in parts.iter().take(6) {
+        let mine: Vec<_> = objects
+            .iter()
+            .filter(|o| o.part_id.as_deref() == Some(part.id.as_str()))
+            .collect();
+        let Some(first_obj) = mine.first() else {
+            continue;
+        };
+        let concept = first_obj.concept.clone();
+        let have: std::collections::HashSet<i64> = mine.iter().map(|o| o.frame_seq).collect();
+        let lo = part
+            .first_seen_sec
+            .and_then(|sec| {
+                frames
+                    .iter()
+                    .min_by(|a, b| {
+                        (a.ts_sec - sec)
+                            .abs()
+                            .partial_cmp(&(b.ts_sec - sec).abs())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|f| f.seq)
+            })
+            .unwrap_or(0);
+        let hi = part
+            .last_seen_sec
+            .and_then(|sec| {
+                frames
+                    .iter()
+                    .min_by(|a, b| {
+                        (a.ts_sec - sec)
+                            .abs()
+                            .partial_cmp(&(b.ts_sec - sec).abs())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|f| f.seq)
+            })
+            .unwrap_or(frames.len() as i64 - 1);
+        if hi <= lo {
+            continue;
+        }
+        // Up to 6 evenly spaced sample frames in [lo, hi].
+        let span = hi - lo;
+        let step = (span / 6).max(1);
+        let mut seq = lo;
+        let mut tried = 0;
+        while seq <= hi && tried < 6 {
+            if !have.contains(&seq) {
+                if let Some(fp) = db::frame_path(db, rid, seq) {
+                    if let Ok(n) =
+                        segment_frame(state, db, rid, &part.id, &concept, seq, &PathBuf::from(fp))
+                            .await
+                    {
+                        added += n;
+                    }
+                }
+                tried += 1;
+            }
+            seq += step;
+        }
+    }
+    if added > 0 {
+        db::trace(
+            db,
+            rid,
+            "sam-3.1",
+            &format!("Sightings pass added {} region(s)", added),
+            None,
+        );
+    }
+}
+
+/// Second pass over steps: enrich each with tools, orientation, warnings,
+/// part counts and an explicit uncertainty flag, from its evidence frame.
+async fn enrich_steps(state: &AppState, db: &db::Db, rid: &str) {
+    if !state.meta.has_key() {
+        return;
+    }
+    let steps = db::list_steps(db, rid);
+    if steps.is_empty() {
+        return;
+    }
+    let schema = serde_json::json!({
+        "type": "object", "additionalProperties": false,
+        "properties": {
+            "tools": {"type": "array", "items": {"type": "string"}},
+            "orientation": {"type": ["string", "null"]},
+            "warnings": {"type": "array", "items": {"type": "string"}},
+            "part_count": {"type": ["integer", "null"]},
+            "uncertain": {"type": "boolean"},
+            "note": {"type": ["string", "null"]}
+        },
+        "required": ["tools", "orientation", "warnings", "part_count", "uncertain", "note"]
+    });
+    let mut enriched = 0;
+    for step in steps.iter().take(10) {
+        let Some(seq) = step.evidence_frame_seq else {
+            continue;
+        };
+        let Some(fp) = db::frame_path(db, rid, seq) else {
+            continue;
+        };
+        let Ok(bytes) = tokio::fs::read(&fp).await else {
+            continue;
+        };
+        let prompt = format!(
+            "This frame shows the result of a hands-on teardown step: \"{}\" Parts involved: {}. From the photo only, extract: tools visible or clearly used; orientation cues for reassembly (e.g. \"loop faces up\"); warnings (fragile, spring-loaded, easy to cross-thread); how many of the main part are visible (part_count); uncertain=true if the frame does not clearly show the step result. Do not invent details you cannot see.",
+            step.action,
+            step.part_names.join(", ")
+        );
+        match state
+            .meta
+            .responses_image_json(&prompt, &bytes, "step_detail", schema.clone())
+            .await
+        {
+            Ok(v) => {
+                let c = db.lock().unwrap();
+                let _ = c.execute(
+                    "UPDATE steps SET detail=?1 WHERE id=?2",
+                    params![serde_json::to_string(&v).unwrap_or_default(), step.id],
+                );
+                enriched += 1;
+            }
+            Err(e) => {
+                db::trace(
+                    db,
+                    rid,
+                    "muse-spark",
+                    &format!("Step enrichment failed: {}", e),
+                    None,
+                );
+            }
+        }
+    }
+    if enriched > 0 {
+        db::trace(
+            db,
+            rid,
+            "muse-spark",
+            &format!(
+                "Enriched {} step(s) with tools/warnings/orientation",
+                enriched
+            ),
+            None,
+        );
     }
 }
 

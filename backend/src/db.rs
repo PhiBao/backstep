@@ -52,6 +52,7 @@ pub fn open(path: &Path) -> anyhow::Result<Db> {
         "ALTER TABLE recordings ADD COLUMN meta_file_id TEXT",
         "ALTER TABLE recordings ADD COLUMN frame_w INTEGER NOT NULL DEFAULT 960",
         "ALTER TABLE recordings ADD COLUMN frame_h INTEGER NOT NULL DEFAULT 540",
+        "ALTER TABLE steps ADD COLUMN detail TEXT",
     ] {
         let _ = conn.execute(stmt, []);
     }
@@ -188,7 +189,7 @@ pub fn list_steps(db: &Db, recording_id: &str) -> Vec<Step> {
         Ok(c) => c,
         Err(_) => return vec![],
     };
-    let mut stmt = match c.prepare("SELECT id,recording_id,order_index,start_sec,end_sec,action,reverse_action,part_names,state_before,state_after,evidence_frame_seq FROM steps WHERE recording_id=?1 ORDER BY order_index") {
+    let mut stmt = match c.prepare("SELECT id,recording_id,order_index,start_sec,end_sec,action,reverse_action,part_names,state_before,state_after,evidence_frame_seq,detail FROM steps WHERE recording_id=?1 ORDER BY order_index") {
         Ok(s) => s, Err(_) => return vec![],
     };
     let rows = stmt.query_map(params![recording_id], |r| {
@@ -205,6 +206,9 @@ pub fn list_steps(db: &Db, recording_id: &str) -> Vec<Step> {
             state_before: r.get(8)?,
             state_after: r.get(9)?,
             evidence_frame_seq: r.get(10)?,
+            detail: r
+                .get::<_, Option<String>>(11)?
+                .and_then(|t| serde_json::from_str(&t).ok()),
         })
     });
     match rows {
