@@ -887,9 +887,10 @@ async fn main() {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(8787);
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
         .expect("bind");
-    println!("[backstep] listening on http://127.0.0.1:{}", port);
+    // 0.0.0.0: Fly's proxy reaches the machine on its external interface.
+    println!("[backstep] listening on port {}", port);
     axum::serve(listener, app).await.expect("serve");
 }
