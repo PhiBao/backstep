@@ -1,0 +1,19 @@
+app = 'backstep-api'
+primary_region = 'sin'
+
+[build]
+
+[http_service]
+  internal_port = 8787
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  size = 'shared-cpu-1x'
+  memory = '1gb'
+
+[mounts]
+  source = 'backstep_data'
+  destination = '/data'
