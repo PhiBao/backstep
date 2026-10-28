@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { decodeMaskToSVGPath } from "@meta-sam/parser";
 
 type Recording = {
   id: string; title: string; kind: string; status: string;
@@ -24,8 +25,38 @@ type Step = {
 type SamObject = {
   id: string; part_id: string | null; concept: string; frame_seq: number; object_id: number;
   x1: number; y1: number; x2: number; y2: number; frame_w: number; frame_h: number;
-  confidence: number | null;
+  confidence: number | null; mask_data?: string | null;
 };
+
+// Decode a stored SAM mask ("H,W,<enc><base85>") into an SVG path in raster coords.
+const maskPathCache = new Map<string, string | null>();
+function maskPath(o: SamObject): string | null {
+  if (!o.mask_data) return null;
+  const hit = maskPathCache.get(o.id);
+  if (hit !== undefined) return hit;
+  let out: string | null = null;
+  try {
+    const first = o.mask_data.indexOf(",");
+    const second = o.mask_data.indexOf(",", first + 1);
+    const height = Number(o.mask_data.slice(0, first));
+    const width = Number(o.mask_data.slice(first + 1, second));
+    // The parser keeps the encoding marker inside the payload.
+    const payload = o.mask_data.slice(second + 1);
+    if (width > 0 && height > 0 && payload) {
+      const path = decodeMaskToSVGPath({
+        encoding: payload.startsWith("~") ? "lossless" : "one_bit",
+        payload,
+        width,
+        height,
+      });
+      out = path || null;
+    }
+  } catch {
+    out = null;
+  }
+  maskPathCache.set(o.id, out);
+  return out;
+}
 type TraceEvent = { id: number; ts: string; stage: string; message: string; detail: string | null };
 type Detail = {
   recording: Recording; frames: Frame[]; parts: Part[]; steps: Step[];
@@ -174,11 +205,38 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    fetch(api("/health")).then((r) => r.json()).then(setHealth).catch(() => setHealth(null));
+    (async () => {
+      // Fly machines may be waking: retry health before declaring backend down.
+      for (let i = 0; i < 6; i++) {
+        try {
+          const r = await fetch(api("/health"));
+          if (r.ok) {
+            setHealth(await r.json());
+            return;
+          }
+        } catch { /* waking */ }
+        await new Promise((res) => setTimeout(res, 2500));
+      }
+      setHealth(null);
+    })();
     loadRecordings().then((recs) => {
-      if (recs.length > 0) setSelectedId(recs[0].id);
+      if (recs.length > 0) {
+        const rank = (r: Recording) => (r.status === "ready" ? 0 : 2) + (r.kind === "upload" ? 0 : 1);
+        const sorted = [...recs].sort((a: Recording, b: Recording) => rank(a) - rank(b));
+        setSelectedId(sorted[0].id);
+      }
     });
   }, [loadRecordings]);
+
+  const orderedRecordings = useMemo(() => {
+    const rank = (r: Recording) =>
+      (r.status === "ready" ? 0 : 2) + (r.kind === "upload" ? 0 : 1);
+    return [...recordings].sort((a, b) => rank(a) - rank(b));
+  }, [recordings]);
+  const featuredId = useMemo(
+    () => orderedRecordings.find((r) => r.kind === "upload" && r.status === "ready")?.id,
+    [orderedRecordings]
+  );
 
   useEffect(() => {
     if (!selectedId) return;
@@ -433,7 +491,7 @@ export default function Home() {
         <aside className="rail">
           <section>
             <h2>Memories</h2>
-            {recordings.map((r) => (
+            {orderedRecordings.map((r) => (
               <button
                 key={r.id}
                 className={`rec-card ${r.id === selectedId ? "active" : ""}`}
@@ -441,13 +499,14 @@ export default function Home() {
               >
                 <div className="rec-title">{r.title}</div>
                 <div className="rec-meta">
+                  {r.id === featuredId ? <span className="badge sample">★ Demo</span> : null}{" "}
                   {r.kind === "sample" ? <span className="badge sample">Sample</span> : <span className="badge status">Upload</span>}{" "}
                   <span className="badge status">{r.status}</span>{" "}
                   {r.frame_count} frames · {tc(r.duration_sec)}
                 </div>
               </button>
             ))}
-            {recordings.length === 0 && <div className="empty">No recordings yet. The backend may still be starting.</div>}
+            {orderedRecordings.length === 0 && <div className="empty">No recordings yet. The backend may still be starting (first wake can take ~20s).</div>}
           </section>
 
           <section>
@@ -589,9 +648,28 @@ export default function Home() {
                         }}
                       />
                     )}
-                    {frameObjects.map((o) => (
+                    {frameObjects.map((o) => {
+                      const path = maskPath(o);
+                      return (
+                      <div key={o.id} style={{ position: "absolute", inset: 0, pointerEvents: "none" }}>
+                        {path && (
+                          <svg
+                            viewBox={`0 0 ${o.frame_w} ${o.frame_h}`}
+                            preserveAspectRatio="none"
+                            style={{ position: "absolute", inset: 0, width: "100%", height: "100%" }}
+                            aria-hidden
+                          >
+                            <path
+                              d={path}
+                              transform={`translate(${o.x1} ${o.y1})`}
+                              fill="rgba(255,90,31,0.45)"
+                              stroke="#FF5A1F"
+                              strokeWidth="2"
+                              vectorEffect="non-scaling-stroke"
+                            />
+                          </svg>
+                        )}
                       <div
-                        key={o.id}
                         className="obj-box"
                         style={{
                           left: `${(o.x1 / o.frame_w) * 100}%`,
@@ -605,7 +683,9 @@ export default function Home() {
                           {o.confidence !== null ? ` · ${o.confidence.toFixed(2)}` : ""}
                         </span>
                       </div>
-                    ))}
+                      </div>
+                      );
+                    })}
                     {drag && currentFrame && (
                       <div
                         className="drag-box"
